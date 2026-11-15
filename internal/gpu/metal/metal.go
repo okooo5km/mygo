@@ -602,7 +602,7 @@ func newRenderer() (r *Renderer, err error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
-	r = &Renderer{images: map[uint64]*texture{}}
+	r = &Renderer{images: map[uint64]*texture{}, sweptAt: time.Now()}
 	// The GPU's quads reach a pixel out of their shapes, glyphs half a
 	// pixel more, as they draw at whole pixels.
 	r.diff.Reach = 2
