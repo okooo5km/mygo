@@ -395,6 +395,7 @@ type Renderer struct {
 	lastRender time.Time
 	trimArmed  bool
 	trimmed    bool
+	trimmedAll bool
 	// canvases are the textures canvases are drawn into, and drawing the
 	// render target drawn into now: the back buffer's, or a canvas's.
 	canvases map[uint64]*canvasTexture
@@ -1203,7 +1204,7 @@ func (r *Renderer) drawFrame(s *scene.Scene) (bool, error) {
 		r.diff.Remember(s)
 		r.pipelines.Remember()
 	}
-	r.lastRender, r.trimmed = r.now, false
+	r.lastRender, r.trimmed, r.trimmedAll = r.now, false, false
 	r.armTrim()
 	return true, nil
 }

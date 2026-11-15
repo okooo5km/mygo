@@ -12,13 +12,15 @@ import (
 // leave: the textures of images the last frame did not draw, the staging
 // textures, and the driver's own memory of the device (IDXGIDevice3::Trim,
 // after ClearState, as its documentation asks: the upload heaps the driver
-// grew with the uploads, among others). A hidden window gives back every
-// texture its frames use, as Metal's renderer does after the same idle
-// time; the next frame makes them again and draws whole. The window's swap
-// chain stays as it is: DWM shows its last frame.
+// grew with the uploads, among others). A window hidden for hiddenAfter
+// gives back every texture its frames use, as Metal's renderer does after
+// the same idle time; the next frame makes them again and draws whole, as
+// the first frame of a new window does. The window's swap chain stays as
+// it is: DWM shows its last frame.
 const (
-	trimAfter = 2 * time.Second
-	trimTimer = 0x6d7a // the timer's ID on the window
+	trimAfter   = 2 * time.Second
+	hiddenAfter = 2 * time.Second
+	trimTimer   = 0x6d7a // the timer's ID on the window
 )
 
 var (
@@ -37,7 +39,10 @@ var (
 
 // armTrim has the window's timer trim the renderer once it draws nothing
 // for trimAfter. A frame drawn meanwhile puts it off (trimIfIdle).
-func (r *Renderer) armTrim() {
+func (r *Renderer) armTrim() { r.armTrimIn(trimAfter) }
+
+// armTrimIn has the window's timer call trimIfIdle after d.
+func (r *Renderer) armTrimIn(d time.Duration) {
 	if r.trimArmed || r.hwnd == 0 {
 		return
 	}
@@ -54,7 +59,7 @@ func (r *Renderer) armTrim() {
 	}
 	trimming[r.hwnd] = r
 	r.trimArmed = true
-	procSetTimer.Call(r.hwnd, trimTimer, uintptr(trimAfter/time.Millisecond), trimProc)
+	procSetTimer.Call(r.hwnd, trimTimer, uintptr(d/time.Millisecond), trimProc)
 }
 
 // disarmTrim stops the trim timer, for a renderer going away.
@@ -72,14 +77,22 @@ func (r *Renderer) disarmTrim() {
 // for that time otherwise; a frame waiting to present, or a call to the
 // swap chain on another goroutine (uncapped.go), puts it off too.
 func (r *Renderer) trimIfIdle() {
-	if r.trimmed || r.device == 0 {
+	if r.device == 0 || r.trimmed && r.trimmedAll {
 		return
 	}
-	if time.Since(r.lastRender) < trimAfter || r.pending || r.aside != "" {
+	idle := time.Since(r.lastRender)
+	if idle < trimAfter || r.pending || r.aside != "" {
 		r.armTrim()
 		return
 	}
-	r.trim(!windowVisible(r.hwnd))
+	hidden := !windowVisible(r.hwnd)
+	if !r.trimmed || hidden && idle >= hiddenAfter {
+		r.trim(hidden && idle >= hiddenAfter)
+	}
+	if hidden && !r.trimmedAll {
+		// Hidden still at hiddenAfter: every texture goes then.
+		r.armTrimIn(max(hiddenAfter-idle, 100*time.Millisecond))
+	}
 }
 
 // windowVisible reports whether the window, and every window it is in,
@@ -92,7 +105,7 @@ func windowVisible(hwnd uintptr) bool {
 // trim gives back what the frames leave, and, hidden, every texture
 // they use.
 func (r *Renderer) trim(hidden bool) {
-	r.trimmed = true
+	r.trimmed, r.trimmedAll = true, hidden
 	r.now = time.Now()
 	for id, t := range r.images {
 		if t.lastFrame != r.frame || hidden {
