@@ -39,6 +39,9 @@ func ClipMaskAlpha(pix []byte, clips []scene.ClipShape, area image.Rectangle) {
 // pixel: RGBA with the coverage in alpha (4), or the coverage alone (1).
 func clipMask(pix []byte, bpp int, clips []scene.ClipShape, area image.Rectangle) {
 	w, h := area.Dx(), area.Dy()
+	if len(clips) == 1 && imageMaskCopy(pix, bpp, &clips[0], area) {
+		return
+	}
 	m := &clipMasker{pix: pix, bpp: bpp, area: area, clips: make([]maskClip, len(clips))}
 	for i := range clips {
 		c := &clips[i]
@@ -229,4 +232,31 @@ func (m *clipMasking) atFrame(t, inv scene.Affine, x, y float32) float32 {
 		return 0
 	}
 	return m.at(lx, ly)
+}
+
+// imageMaskCopy writes the coverage of c, a clip that is only an image's
+// alpha over its rectangle, on whole pixels, one texel a pixel (a path's
+// mask, as package ui makes it for Painter.ClipPath), as the alpha it
+// copies: what the coverage test and the sampling compute there, exactly
+// (the rectangle covers its pixels whole, and each pixel's center is a
+// texel's). It reports whether c is such a clip.
+func imageMaskCopy(pix []byte, bpp int, c *scene.ClipShape, area image.Rectangle) bool {
+	m := c.Mask
+	r := c.Rect
+	if m == nil || c.Transform.Set || c.Paint != scene.PaintSolid || c.Radii != [4]float32{} ||
+		c.MaskSrc != (scene.Rect{W: float32(m.W), H: float32(m.H)}) || r.W != float32(m.W) || r.H != float32(m.H) ||
+		r.X != float32(math.Floor(float64(r.X))) || r.Y != float32(math.Floor(float64(r.Y))) || len(m.Pix) < 4*m.W*m.H {
+		return false
+	}
+	w := area.Dx()
+	ox, oy := int(r.X)-area.Min.X, int(r.Y)-area.Min.Y
+	clear(pix)
+	for y := max(0, oy); y < min(area.Dy(), oy+m.H); y++ {
+		src := m.Pix[4*(y-oy)*m.W:]
+		dst := pix[bpp*y*w:]
+		for x := max(0, ox); x < min(w, ox+m.W); x++ {
+			dst[bpp*x+bpp-1] = src[4*(x-ox)+3]
+		}
+	}
+	return true
 }

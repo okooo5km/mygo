@@ -136,3 +136,37 @@ func TestClipMaskAlphaIsClipMasksAlpha(t *testing.T) {
 		}
 	}
 }
+
+func TestImageMaskCopyIsTheCoverage(t *testing.T) {
+	// A path's mask as package ui makes it: the copy is what the per-pixel
+	// coverage and sampling make, in RGBA and in one byte a pixel.
+	rng := rand.New(rand.NewPCG(5, 9))
+	for range 20 {
+		w, h := 20+rng.IntN(80), 20+rng.IntN(80)
+		img := scene.NewImageRGBA(w, h, make([]byte, 4*w*h))
+		for i := range img.Pix {
+			img.Pix[i] = byte(rng.IntN(256))
+		}
+		c := scene.ClipShape{Rect: scene.Rect{X: float32(rng.IntN(40) - 20), Y: float32(rng.IntN(40) - 20), W: float32(w), H: float32(h)},
+			Mask: img, MaskSrc: scene.Rect{W: float32(w), H: float32(h)}}
+		area := image.Rect(-10, -10, 90, 90)
+		got := make([]byte, 4*area.Dx()*area.Dy())
+		if !imageMaskCopy(got, 4, &c, area) {
+			t.Fatal("not copied")
+		}
+		want := make([]byte, len(got))
+		m := &clipMasker{pix: want, bpp: 4, area: area, clips: make([]maskClip, 1)}
+		mc := &m.clips[0]
+		mc.shape = newShape(c.Rect, scene.Corners(c.Rect, c.Radii, c.Continuous))
+		mc.inverse, mc.valid = c.Transform.Inverse()
+		mc.mask, mc.masked = newClipMasking(&c), true
+		mc.x0, mc.x1, mc.y0, mc.y1 = -1000, 1000, -1000, 1000
+		m.transformed = true
+		for y := range area.Dy() {
+			m.row(0, y)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatal("the copy differs from the coverage")
+		}
+	}
+}
