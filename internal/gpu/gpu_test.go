@@ -67,7 +67,8 @@ func TestAffineClipMaskCacheFollowsClipInsteadOfContent(t *testing.T) {
 	}
 	s.Ops[0].Rect.W = 60
 	build()
-	if mask.ID() != id || mask.W != 70 || b.Instances[0].Clip != [4]float32{10, 10, 70, 50} {
+	// The mask covers the clip with a margin, maskMargin pixels each way.
+	if mask.ID() != id || mask.W != 70+2*maskMargin || b.Instances[0].Clip != [4]float32{10 - maskMargin, 10 - maskMargin, 70 + 2*maskMargin, 50 + 2*maskMargin} {
 		t.Fatal("a clip that shrank did not keep its mask's size")
 	}
 	clipped := s.Ops
@@ -114,7 +115,8 @@ func TestGrowingClipKeepsItsMask(t *testing.T) {
 		// frame pixels, hold the coverage of a mask of the scissor alone.
 		sc := b.Batches[0].Scissor
 		area := image.Rect(int(sc.Left), int(sc.Top), int(sc.Right), int(sc.Bottom))
-		want := raster.ClipMask(nil, b.maskSlots[0].shapes, area)
+		// The clip's coverage where it is, in the frame's coordinates.
+		want := raster.ClipMask(nil, []scene.ClipShape{scene.ClipShapeOf(&s.Ops[0], s.Stops)}, area)
 		at := b.Instances[0].Clip
 		ox, oy := area.Min.X-int(at[0]), area.Min.Y-int(at[1])
 		if int(at[2]) != mask.W || int(at[3]) != mask.H || ox < 0 || oy < 0 || ox+area.Dx() > mask.W || oy+area.Dy() > mask.H {
@@ -122,8 +124,8 @@ func TestGrowingClipKeepsItsMask(t *testing.T) {
 		}
 		for y := range area.Dy() {
 			got := mask.Pix[4*((oy+y)*mask.W+ox):][:4*area.Dx()]
-			if !bytes.Equal(got, want.Pix[4*y*area.Dx():][:4*area.Dx()]) {
-				t.Fatalf("frame %d: row %d of the mask differs from the clip's coverage", i, y)
+			if d := maxDiff(got, want.Pix[4*y*area.Dx():][:4*area.Dx()]); d > 1 {
+				t.Fatalf("frame %d: row %d of the mask differs from the clip's coverage by %d levels", i, y, d)
 			}
 		}
 	}
@@ -239,9 +241,9 @@ func TestTurningCardMasksKeepWithinBudget(t *testing.T) {
 		}
 	}
 	t.Logf("%d masks, %.1f MB of pixels, %.1f MB kept; budget %d MB",
-		len(b.maskSlots), float64(length)/(1<<20), float64(capacity)/(1<<20), idleMaskBytes>>20)
-	if idle > idleMaskBytes {
-		t.Errorf("idle masks keep %.1f MB, beyond the budget of %d MB", float64(idle)/(1<<20), idleMaskBytes>>20)
+		len(b.maskSlots), float64(length)/(1<<20), float64(capacity)/(1<<20), 4*idleMaskPixels>>20)
+	if idle > 4*idleMaskPixels {
+		t.Errorf("idle masks keep %.1f MB, beyond the budget of %d MB", float64(idle)/(1<<20), 4*idleMaskPixels>>20)
 	}
 	if capacity > 2*length {
 		t.Errorf("masks keep %.1f MB for %.1f MB of pixels", float64(capacity)/(1<<20), float64(length)/(1<<20))
@@ -378,7 +380,7 @@ func TestClipReachingRoundedCornersIsMasked(t *testing.T) {
 	// The column's fill: its rectangle in the shader, the card's mask
 	// over the card's scissor rectangle, transparent in its corners.
 	in := b.Instances[b.OpStart[3]]
-	if in.Clip != [4]float32{12, 102, 296, 156} || in.ClipRadii != [4]float32{12, 22, 296, 236} {
+	if in.Clip != [4]float32{12, 102, 296, 156} || in.ClipRadii != [4]float32{12 - maskMargin, 22 - maskMargin, 296 + 2*maskMargin, 236 + 2*maskMargin} {
 		t.Fatalf("column's clip %v, mask's area %v", in.Clip, in.ClipRadii)
 	}
 	var batch *Batch
@@ -391,8 +393,8 @@ func TestClipReachingRoundedCornersIsMasked(t *testing.T) {
 		t.Fatal("the column's fill has no clip mask")
 	}
 	m := masks[batch.ClipMask-1]
-	alpha := func(x, y int) byte { return m.Pix[4*((y-22)*m.W+x-12)+3] }
-	if m.W != 296 || m.H != 236 || alpha(12, 257) != 0 || alpha(307, 257) != 0 || alpha(160, 250) != 255 {
+	alpha := func(x, y int) byte { return m.Pix[4*((y-22+maskMargin)*m.W+x-12+maskMargin)+3] }
+	if m.W != 296+2*maskMargin || m.H != 236+2*maskMargin || alpha(12, 257) != 0 || alpha(307, 257) != 0 || alpha(160, 250) != 255 {
 		t.Errorf("the card's mask (%dx%d) leaves its corners: %d %d, middle %d", m.W, m.H, alpha(12, 257), alpha(307, 257), alpha(160, 250))
 	}
 }
@@ -430,7 +432,7 @@ func TestPanesReachingRoundedCornersShareTheirMask(t *testing.T) {
 	// The middle pane reaches none of the corners: the shader cuts it.
 	for i, in := range b.Instances {
 		if middle := i/2 == 1; middle && in.Transform1[3] != 0 ||
-			!middle && (in.Transform1[3] != 2 || in.ClipRadii != [4]float32{18, 18, 1244, 764}) {
+			!middle && (in.Transform1[3] != 2 || in.ClipRadii != [4]float32{18 - maskMargin, 18 - maskMargin, 1244 + 2*maskMargin, 764 + 2*maskMargin}) {
 			t.Errorf("instance %d: clip mode %v, mask's area %v", i, in.Transform1[3], in.ClipRadii)
 		}
 	}
@@ -495,7 +497,7 @@ func TestSidebarInContinuousFrameIsCutInTheShader(t *testing.T) {
 	// Without the curves in the shader, the frame's mask, shared.
 	other, bytes := build(false)
 	defer other.Release()
-	if want := 4 * int(frame.W*frame.H); bytes != want || len(other.maskSlots) != 1 {
+	if want := 4 * int(frame.W+2*maskMargin) * int(frame.H+2*maskMargin); bytes != want || len(other.maskSlots) != 1 {
 		t.Errorf("without continuous clips in the shader: %d bytes of masks in %d, want the frame's %d", bytes, len(other.maskSlots), want)
 	}
 }
@@ -513,7 +515,7 @@ func TestPanesInContinuousCornersCutInTheShader(t *testing.T) {
 	defer b.Release()
 	var masks []*scene.Image
 	b.Build(s, func(m *scene.Image) uintptr { masks = append(masks, m); return uintptr(len(masks)) })
-	if len(masks) != 1 || masks[0].W != 136 || masks[0].H != 60 {
+	if len(masks) != 1 || masks[0].W != 136+2*maskMargin || masks[0].H != 60+2*maskMargin {
 		t.Fatalf("rasterized %d clip masks, want the rounded clip's", len(masks))
 	}
 	frame := scene.Corners(scene.Rect{X: 18, Y: 18, W: 604, H: 236}, scene.Uniform(12), true)
@@ -523,7 +525,7 @@ func TestPanesInContinuousCornersCutInTheShader(t *testing.T) {
 		6:  {{0}, {18, 18, 604, 236}, frame},
 		8:  {{0}, {18, 18, 604, 236}, frame},
 		15: {{0}, {16, 280, 120.5, 124}, {-16, 0, 0, -16}},
-		18: {{1}, {488, 344, 136, 60}, {}},
+		18: {{1}, {488 - maskMargin, 344 - maskMargin, 136 + 2*maskMargin, 60 + 2*maskMargin}, {}},
 	} {
 		ins := b.Instances[b.OpStart[op]:b.OpStart[op+1]]
 		if len(ins) == 0 {
@@ -1423,4 +1425,20 @@ func TestMovedClipStaysInTheShader(t *testing.T) {
 	if in := b.Instances[0]; in.Transform1[3] != 0 || in.Clip != [4]float32{20, 57.5, 200, 100} {
 		t.Fatalf("clip %v, mask mode %v", in.Clip, in.Transform1[3])
 	}
+}
+
+// maxDiff returns the largest difference between bytes of a and b.
+func maxDiff(a, b []byte) int {
+	d := 0
+	for i := range a {
+		d = max(d, abs(int(a[i])-int(b[i])))
+	}
+	return d
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

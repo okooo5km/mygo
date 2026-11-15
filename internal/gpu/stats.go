@@ -14,7 +14,11 @@ func (b *Builder) Summary() string {
 			opaque++
 		}
 	}
-	return fmt.Sprintf("%d instances in %d batches (%d opaque; by class general %d, plain %d, fill %d, shadow %d, glyph %d, subpixel %d, image %d), %d ops culled, %d opaque cores",
+	s := fmt.Sprintf("%d instances in %d batches (%d opaque; by class general %d, plain %d, fill %d, shadow %d, glyph %d, subpixel %d, image %d), %d ops culled, %d opaque cores",
 		len(b.Instances), len(b.Batches), opaque, classes[ClassGeneral], classes[ClassPlain], classes[ClassFill], classes[ClassShadow], classes[ClassGlyph],
 		classes[ClassSubpixel], classes[ClassImage], b.Culled, b.OpaqueCores)
+	if b.MasksDrawn > 0 || b.MasksReused > 0 {
+		s += fmt.Sprintf(", clip masks %d rasterized (%d px), %d reused", b.MasksDrawn, b.MaskPixels, b.MasksReused)
+	}
+	return s
 }

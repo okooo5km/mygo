@@ -147,13 +147,32 @@ func MovedClipOp(op *Op) Op {
 
 // moveGradient moves the points of the op's gradient by (x, y); stripes
 // start from Rect.
-func (op *Op) moveGradient(x, y float32) {
-	switch op.Paint {
+func (op *Op) moveGradient(x, y float32) { op.Gradient = MoveGradient(op.Paint, op.Gradient, x, y) }
+
+// MoveGradient returns the points g of a gradient painted with p moved by
+// (x, y); stripes, which start from their rectangle, stay as they are.
+func MoveGradient(p Paint, g [4]float32, x, y float32) [4]float32 {
+	switch p {
 	case PaintLinear, PaintOklab, PaintLinearStops, PaintLinearStopsOklab:
-		op.Gradient = [4]float32{op.Gradient[0] + x, op.Gradient[1] + y, op.Gradient[2] + x, op.Gradient[3] + y}
+		return [4]float32{g[0] + x, g[1] + y, g[2] + x, g[3] + y}
 	case PaintConic, PaintConicOklab, PaintRadial, PaintRadialOklab:
-		op.Gradient[0], op.Gradient[1] = op.Gradient[0]+x, op.Gradient[1]+y
+		g[0], g[1] = g[0]+x, g[1]+y
 	}
+	return g
+}
+
+// Moved returns the clip moved by (x, y) in the frame: its transform
+// followed by the move, or, when it has none, its rectangle and its
+// gradient's points moved.
+func (c ClipShape) Moved(x, y float32) ClipShape {
+	if c.Transform.Set {
+		c.Transform = Translation(x, y).Mul(c.Transform)
+		return c
+	}
+	c.Rect.X += x
+	c.Rect.Y += y
+	c.Gradient = MoveGradient(c.Paint, c.Gradient, x, y)
+	return c
 }
 
 // Reshaped reports whether op of s draws under a transform that does more

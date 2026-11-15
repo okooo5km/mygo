@@ -11,25 +11,58 @@ import (
 )
 
 // clipMaskSlot is a retained clip mask. Masks outlive the frames that
-// don't use them, up to idleMaskBytes of them, so a transform that comes
+// don't use them, up to idleMaskPixels of them, so a transform that comes
 // and goes finds its masks again instead of rasterizing them.
+//
+// A mask is of its clips' own shape, not of where they are in the frame:
+// shapes are the clips as the mask has them, moved so that the mask's
+// pixel (0, 0) is the frame's pixel origin, wherever that is (maskPlace).
+// A clip that only moves by whole pixels, as a card scrolled with its
+// list or a pane sliding in, finds the mask it had, which the shaders
+// sample at its new place. Its stops are in stops, and w×h are the pixels
+// it covers, of its texture.
 type clipMaskSlot struct {
-	// shapes are the clips the mask is of, their stops in stops, and area
-	// the frame pixels it covers: the clip's scissor rectangle, or more
-	// for a clip that grows (maskArea).
 	shapes []scene.ClipShape
 	stops  []scene.Stop
-	area   image.Rectangle
-	image  *scene.Image
+	w, h   int
+	// tex is the texture of the mask that MaskTextures made, or, without
+	// them, image holds its coverage in alpha, which the renderer uploads
+	// as any image.
+	tex   uintptr
+	image *scene.Image
 	// frame is the last frame that used the mask, and slot the clip's
 	// place among that frame's masked clips.
 	frame uint64
 	slot  int
 }
 
-// idleMaskBytes is how much memory the masks no clip of the frame uses
-// keep, the least recently used dropped first.
-const idleMaskBytes = 32 << 20
+// MaskTextures makes the textures of clip masks from their coverage, one
+// byte a pixel, for a renderer that keeps them in single-channel textures
+// (A8): a quarter of the memory of an RGBA image. Without it the builder
+// hands masks to the renderer as images, their coverage in alpha.
+type MaskTextures interface {
+	// MaskTexture returns a texture of w×h holding pix, rows of w bytes:
+	// tex, which a mask of that size had, refilled, or a new one, which
+	// the builder frees with FreeMask; 0 when it cannot.
+	MaskTexture(tex uintptr, w, h int, pix []byte) uintptr
+	// FreeMask frees a texture MaskTexture returned.
+	FreeMask(tex uintptr)
+}
+
+// idleMaskPixels is how many pixels of the masks no clip of the frame
+// uses are kept, the least recently used dropped first: 8 MB of
+// single-channel textures.
+const idleMaskPixels = 8 << 20
+
+// maskScratchKeep is the most bytes of coverage the builder keeps between
+// frames to rasterize masks into; a larger buffer goes after a frame that
+// rasterized none.
+const maskScratchKeep = 1 << 20
+
+// maskMargin is how many pixels a mask reaches beyond its clips' bounds:
+// continuous corners antialias up to 3 out (raster.ClipMask), and one more
+// is transparent all round, which sampling beyond the texture repeats.
+const maskMargin = 4
 
 func (b *Builder) prepare(in *Instance, m scene.Affine, c *clip) bool {
 	b.preparedMask = 0
@@ -248,15 +281,17 @@ func (b *Builder) clipTexture(c *clip, shapes []scene.ClipShape) uintptr {
 		return c.maskTexture
 	}
 	area := image.Rect(int(c.scissor.Left), int(c.scissor.Top), int(c.scissor.Right), int(c.scissor.Bottom))
-	// The mask of the same clip, in this frame or an earlier one; else
-	// the one the clip in its place had last frame, which it most likely
-	// is, changed; else a new one.
+	place, kept := b.maskPlace(area, shapes)
+	w, h := place.Dx(), place.Dy()
+	// The mask of the same shapes, of this frame or an earlier one, however
+	// they moved by whole pixels; else the one the clip in its place had
+	// last frame, which it most likely is, changed; else a new one.
 	found, reuse := -1, -1
 	for i := range b.maskSlots {
 		m := &b.maskSlots[i]
-		// A mask of more of the frame than the clip's scissor rectangle
-		// holds the same coverage there.
-		if area.In(m.area) && slices.EqualFunc(m.shapes, shapes, func(a, b scene.ClipShape) bool { return a.Same(&b) }) {
+		// A mask of more than the clip needs holds the same coverage where
+		// it does: each pixel's is of the shapes alone.
+		if w <= m.w && h <= m.h && slices.EqualFunc(m.shapes, kept, func(a, b scene.ClipShape) bool { return a.Same(&b) }) {
 			found = i
 			break
 		}
@@ -264,41 +299,124 @@ func (b *Builder) clipTexture(c *clip, shapes []scene.ClipShape) uintptr {
 			reuse = i
 		}
 	}
-	if found < 0 {
+	if found >= 0 {
+		b.MasksReused++
+	} else {
 		found = reuse
 		if found < 0 {
 			found = len(b.maskSlots)
 			b.maskSlots = append(b.maskSlots, clipMaskSlot{})
 		}
 		m := &b.maskSlots[found]
-		m.area = maskArea(area, m.image, b.stack[0].scissor)
-		m.image = raster.ClipMask(m.image, shapes, m.area)
-		m.keep(shapes)
+		frame := b.stack[0].scissor
+		mw, mh := maskSize(w, h, m.w, m.h, int(frame.Right-frame.Left), int(frame.Bottom-frame.Top))
+		m.keep(kept)
+		if !b.rasterize(m, mw, mh) {
+			b.dropSlot(found)
+			return 0
+		}
 	}
 	m := &b.maskSlots[found]
 	m.frame, m.slot = b.frame, c.maskSlot
-	c.maskArea = m.area
-	c.maskTexture = b.imageTexture(m.image)
+	c.maskArea = image.Rect(place.Min.X, place.Min.Y, place.Min.X+m.w, place.Min.Y+m.h)
+	if m.tex != 0 {
+		c.maskTexture = m.tex
+	} else {
+		c.maskTexture = b.imageTexture(m.image)
+	}
 	return c.maskTexture
 }
 
-// maskArea returns the frame pixels to rasterize a clip's mask into,
-// for a clip whose scissor rectangle is area, given had, the mask the
-// clip in its place had last frame. A new mask covers area. Otherwise
-// the mask keeps had's size, placed where area fits in it, so that a
-// clip that changes reuses its mask's memory and texture instead of
-// allocating both again on every frame of its animation. A card growing
+// maskPlace returns the frame pixels the mask of shapes covers, for a
+// clip whose scissor rectangle is area, and the shapes the mask is of,
+// moved so that the mask starts at the frame's origin. Shapes that the
+// scissor rectangle cuts exactly (a rectangle on whole pixels, nothing
+// transforming or masking it) and those letting everything through
+// within area are left out: they change nothing where the mask is read.
+// The mask covers what the other shapes can let through, with a margin,
+// rather than area alone, so that it holds as a clip scrolls into view or
+// out of it; unless that is much more than area and than the frame, as for
+// a clip around a long scrolled page, when it covers area alone.
+func (b *Builder) maskPlace(area image.Rectangle, shapes []scene.ClipShape) (image.Rectangle, []scene.ClipShape) {
+	kept := b.maskShapes[:0]
+	sa := scene.Rect{X: float32(area.Min.X), Y: float32(area.Min.Y), W: float32(area.Dx()), H: float32(area.Dy())}
+	for i := range shapes {
+		sh := &shapes[i]
+		if !sh.Transform.Set && !sh.Masks() {
+			if sh.Radii == [4]float32{} && integerClip(sh.Rect) {
+				continue
+			}
+			if c := (clip{rect: sh.Rect, radii: scene.Corners(sh.Rect, sh.Radii, sh.Continuous)}); clipOpaqueWithin(&c, sa) {
+				continue
+			}
+		}
+		kept = append(kept, *sh)
+	}
+	if len(kept) == 0 {
+		// Every pixel of area is let through: the innermost clip's mask
+		// holds that.
+		kept = append(kept, shapes[len(shapes)-1])
+	}
+	place := area
+	bounds := scene.Rect{X: -1e9, Y: -1e9, W: 2e9, H: 2e9}
+	for i := range kept {
+		bounds = bounds.Intersect(kept[i].Transform.Bounds(kept[i].Rect))
+	}
+	if bounds.W > 0 && bounds.H > 0 && bounds.W < 1e6 && bounds.H < 1e6 {
+		own := image.Rect(int(math.Floor(float64(bounds.X)))-maskMargin, int(math.Floor(float64(bounds.Y)))-maskMargin,
+			int(math.Ceil(float64(bounds.X+bounds.W)))+maskMargin, int(math.Ceil(float64(bounds.Y+bounds.H)))+maskMargin)
+		frame := b.stack[0].scissor
+		most := max(4*area.Dx()*area.Dy(), int(frame.Right-frame.Left)*int(frame.Bottom-frame.Top))
+		if own.Dx()*own.Dy() <= most {
+			place = own
+		}
+	}
+	for i := range kept {
+		kept[i] = maskLocal(kept[i], place.Min.X, place.Min.Y)
+	}
+	b.maskShapes = kept
+	return place, kept
+}
+
+// maskLocal returns c as the mask starting at the frame's pixel (x, y) has
+// it: moved by (-x, -y). A clip without a transform has its places
+// snapped to 1/maskGrid of a pixel, so that the same shape moved by whole
+// pixels is the same mask though float32 rounded the sums that placed it
+// differently: what is rasterized differs from the exact places by
+// 1/(2*maskGrid) of a pixel at most, far under what a level of coverage
+// takes. A transformed clip is moved by its transform, exactly (its
+// coverage depends on where its rectangle lies under the transform, by a
+// few levels at continuous corners, so it is not put in another form).
+func maskLocal(c scene.ClipShape, x, y int) scene.ClipShape {
+	if c.Transform.Set {
+		return c.Moved(float32(-x), float32(-y))
+	}
+	snap := func(v float64) float32 { return float32(math.Round(v*maskGrid) / maskGrid) }
+	g := scene.MoveGradient(c.Paint, c.Gradient, float32(-x), float32(-y))
+	for i, v := range g {
+		if g[i] != c.Gradient[i] {
+			g[i] = snap(float64(v))
+		}
+	}
+	c.Gradient = g
+	c.Rect.X, c.Rect.Y = snap(float64(c.Rect.X)-float64(x)), snap(float64(c.Rect.Y)-float64(y))
+	return c
+}
+
+// maskGrid is how many places a pixel has for a mask's shapes (maskLocal).
+const maskGrid = 4096
+
+// maskSize returns the size of the mask of w×h pixels that a slot holding
+// one of had×hadH takes: a new mask its own; otherwise the size it had,
+// so that a clip that changes reuses its mask's memory and texture instead
+// of allocating both again on every frame of its animation. A card growing
 // out of a cover to fill the window allocated 190 MB in 40 frames
 // (egoist/mygo-music#55). A side that outgrows it doubles, up to the
 // frame's size, and a clip that shrinks to less than a quarter of it
 // takes its own size.
-func maskArea(area image.Rectangle, had *scene.Image, frame Scissor) image.Rectangle {
-	if had == nil || had.W <= 0 || had.H <= 0 {
-		return area
-	}
-	w, h := area.Dx(), area.Dy()
-	if 4*w*h < had.W*had.H {
-		return area
+func maskSize(w, h, had, hadH, fw, fh int) (int, int) {
+	if had <= 0 || hadH <= 0 || 4*w*h < had*hadH {
+		return w, h
 	}
 	grow := func(n, was, most int) int {
 		if n <= was {
@@ -306,14 +424,55 @@ func maskArea(area image.Rectangle, had *scene.Image, frame Scissor) image.Recta
 		}
 		return max(n, min(2*was, most))
 	}
-	w, h = grow(w, had.W, int(frame.Right-frame.Left)), grow(h, had.H, int(frame.Bottom-frame.Top))
-	// Within the frame where it fits, rather than rasterizing what is off
-	// it.
-	place := func(lo, hi, n int, end int32) int {
-		return max(min(lo, int(end)-n), hi-n)
+	return grow(w, had, fw), grow(h, hadH, fh)
+}
+
+// rasterize makes m's mask of mw×mh pixels from its shapes, into its
+// texture or its image, and reports whether it could.
+func (b *Builder) rasterize(m *clipMaskSlot, mw, mh int) bool {
+	n := mw * mh
+	b.MasksDrawn++
+	b.MaskPixels += n
+	b.maskDrawn = true
+	if b.MaskTextures == nil {
+		if m.image == nil {
+			m.image = scene.NewImageRGBA(mw, mh, make([]byte, 4*n))
+		} else if m.image.W != mw || m.image.H != mh {
+			m.image.Resize(mw, mh)
+		}
+		m.image = raster.ClipMask(m.image, m.shapes, image.Rect(0, 0, mw, mh))
+		m.w, m.h = mw, mh
+		return true
 	}
-	x, y := place(area.Min.X, area.Max.X, w, frame.Right), place(area.Min.Y, area.Max.Y, h, frame.Bottom)
-	return image.Rect(x, y, x+w, y+h)
+	if cap(b.maskPix) < n {
+		b.maskPix = make([]byte, n)
+	}
+	pix := b.maskPix[:n]
+	raster.ClipMaskAlpha(pix, m.shapes, image.Rect(0, 0, mw, mh))
+	had := m.tex
+	if m.w != mw || m.h != mh {
+		had = 0
+	}
+	tex := b.MaskTextures.MaskTexture(had, mw, mh, pix)
+	if m.tex != 0 && m.tex != tex {
+		b.MaskTextures.FreeMask(m.tex)
+	}
+	m.tex, m.w, m.h = tex, mw, mh
+	return tex != 0
+}
+
+// dropSlot frees mask slot i and removes it.
+func (b *Builder) dropSlot(i int) {
+	b.freeSlot(&b.maskSlots[i])
+	b.maskSlots = slices.Delete(b.maskSlots, i, i+1)
+}
+
+// freeSlot frees the texture of m that MaskTextures made.
+func (b *Builder) freeSlot(m *clipMaskSlot) {
+	if m.tex != 0 && b.MaskTextures != nil {
+		b.MaskTextures.FreeMask(m.tex)
+	}
+	m.tex = 0
 }
 
 // areaRect returns area, a mask's frame pixels, as the shaders take it:
@@ -340,8 +499,13 @@ func (m *clipMaskSlot) keep(shapes []scene.ClipShape) {
 }
 
 // dropIdleMasks drops the least recently used masks this frame didn't use
-// beyond idle bytes of them.
+// beyond idle pixels of them, and the scratch the frame's masks were
+// rasterized in once it is large and no mask was.
 func (b *Builder) dropIdleMasks(idle int) {
+	if !b.maskDrawn && cap(b.maskPix) > maskScratchKeep {
+		b.maskPix = nil
+	}
+	b.maskDrawn = false
 	slices.SortFunc(b.maskSlots, func(x, y clipMaskSlot) int { return cmp.Compare(y.frame, x.frame) })
 	for i := range b.maskSlots {
 		m := &b.maskSlots[i]
@@ -350,10 +514,24 @@ func (b *Builder) dropIdleMasks(idle int) {
 		}
 		// The memory a mask keeps, which may be more than its pixels
 		// take up: Resize reuses it for smaller ones.
-		if idle -= cap(m.image.Pix); idle < 0 {
+		kept := m.w * m.h
+		if m.image != nil {
+			kept = cap(m.image.Pix) / 4
+		}
+		if idle -= kept; idle < 0 {
+			for j := i; j < len(b.maskSlots); j++ {
+				b.freeSlot(&b.maskSlots[j])
+			}
 			clear(b.maskSlots[i:])
 			b.maskSlots = b.maskSlots[:i]
 			return
 		}
+	}
+}
+
+// releaseMasks frees every mask's texture.
+func (b *Builder) releaseMasks() {
+	for i := range b.maskSlots {
+		b.freeSlot(&b.maskSlots[i])
 	}
 }

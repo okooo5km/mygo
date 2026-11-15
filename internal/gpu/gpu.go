@@ -315,15 +315,25 @@ type Builder struct {
 	// cuts tells, for each op of the scene, that it pushes a clip that
 	// reaches into the rounded corners of a clip around it
 	// (scene.ClipCorners), which the scissor rectangles don't cut.
-	cuts         []bool
-	corners      scene.ClipCorners
-	pushes       []int
-	clipShapes   []scene.ClipShape
-	maskSlots    []clipMaskSlot
-	maskUsed     int
-	frame        uint64
-	imageTexture func(*scene.Image) uintptr
-	preparedMask uintptr
+	cuts       []bool
+	corners    scene.ClipCorners
+	pushes     []int
+	clipShapes []scene.ClipShape
+	maskSlots  []clipMaskSlot
+	maskShapes []scene.ClipShape
+	maskPix    []byte
+	maskDrawn  bool
+	maskUsed   int
+	// MaskTextures, unless nil, makes the textures of clip masks, in one
+	// channel (see MaskTextures); the builder frees them as it drops the
+	// masks, and in Release.
+	MaskTextures MaskTextures
+	// MasksDrawn and MaskPixels are how many clip masks the last Build
+	// rasterized, and their pixels; MasksReused how many it found made.
+	MasksDrawn, MaskPixels, MasksReused int
+	frame                               uint64
+	imageTexture                        func(*scene.Image) uintptr
+	preparedMask                        uintptr
 	// Chroma, unless nil, returns the texture of the chroma of an image
 	// showing a frame in NV12 (scene.SurfaceNV12), after the image's
 	// texture, its luma, was asked for: renderers that sample such frames
@@ -474,6 +484,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 	b.markEnclosing(s)
 	b.imageTexture = image
 	b.maskUsed = 0
+	b.MasksDrawn, b.MaskPixels, b.MasksReused = 0, 0, 0
 	b.frame++
 	b.clipShapes = b.clipShapes[:0]
 	b.Instances = b.Instances[:0]
@@ -683,7 +694,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 
 	b.OpStart = append(b.OpStart, int32(len(b.Instances)))
 	b.joinLast()
-	b.dropIdleMasks(idleMaskBytes)
+	b.dropIdleMasks(idleMaskPixels)
 	b.imageTexture = nil
 	return s
 }
@@ -826,7 +837,11 @@ func (b *Builder) markEnclosing(s *scene.Scene) {
 }
 
 // Release frees the retained clipping resources and instance buffers.
-func (b *Builder) Release() { *b = Builder{} }
+func (b *Builder) Release() {
+	b.releaseMasks()
+	masks := b.MaskTextures
+	*b = Builder{MaskTextures: masks}
+}
 
 // add appends an instance within the current clip, starting a batch when
 // the scissor rectangle or the image changes, or after an effect's.
