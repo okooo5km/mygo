@@ -268,6 +268,8 @@ type texture struct {
 	w, h      int
 	gen, ver  uint64
 	lastFrame uint64
+	// lastDrawn is when the frame that last drew it began.
+	lastDrawn time.Time
 }
 
 // canvasTexture is the texture a canvas (scene.NewCanvas) is drawn into,
@@ -378,6 +380,21 @@ type Renderer struct {
 	video       videoState
 	frame       uint64
 	swept       uint64 // the frame of the last sweep
+	// sweptAt is when the last sweep ran, and now when the frame being
+	// drawn began, which the textures it draws take as when they were
+	// last drawn.
+	sweptAt, now time.Time
+	// stages are the staging textures uploads go through (staging.go), by
+	// format, and masks the textures of clip masks (gpu.MaskTextures), by
+	// their views.
+	stages map[uint32]*stages
+	masks  map[uintptr]*texture
+	// lastRender is when the last frame drew, and trimArmed tells that the
+	// trim timer waits for the window to be idle (trim.go); trimmed that it
+	// trimmed what the frames use since.
+	lastRender time.Time
+	trimArmed  bool
+	trimmed    bool
 	// canvases are the textures canvases are drawn into, and drawing the
 	// render target drawn into now: the back buffer's, or a canvas's.
 	canvases map[uint64]*canvasTexture
@@ -454,7 +471,7 @@ func newRenderer(hwnd uintptr, composed bool) (*Renderer, error) {
 	if hwnd == 0 {
 		return nil, errors.New("d3d11: no window")
 	}
-	r := &Renderer{hwnd: hwnd, composed: composed, uncapped: pacing.Uncapped, images: map[uint64]*texture{}}
+	r := &Renderer{hwnd: hwnd, composed: composed, uncapped: pacing.Uncapped, images: map[uint64]*texture{}, sweptAt: time.Now()}
 	d, err := acquireDevice()
 	if err != nil {
 		return nil, err
@@ -821,6 +838,7 @@ func (r *Renderer) Release() {
 	r.gaveUp = false
 	r.lat.release()
 	r.cost.release()
+	r.disarmTrim()
 	r.b.Release()
 	if settling[r.hwnd] {
 		delete(settling, r.hwnd)
@@ -834,6 +852,11 @@ func (r *Renderer) Release() {
 		freeTexture(t)
 	}
 	r.images = nil
+	for _, t := range r.masks {
+		freeTexture(t)
+	}
+	r.masks = nil
+	r.dropStages(time.Time{})
 	r.releaseShared()
 	r.sweepShared(true)
 	for _, t := range r.canvases {
@@ -873,8 +896,13 @@ func (r *Renderer) newTexture(t *texture, w, h int, format uint32, pix []byte, b
 	free(&t.srv)
 	free(&t.tex)
 	desc := texture2DDesc{Width: uint32(w), Height: uint32(h), MipLevels: 1, ArraySize: 1, Format: format, SampleCount: 1, Usage: usageDefault, BindFlags: bindShaderResource}
+	// Created empty, its pixels uploaded through the staging textures
+	// rather than given as initial data, which the driver would copy
+	// through its own upload heaps (staging.go); but for the few texels of
+	// gradients' stops (16 bytes each), which a staging texture of their
+	// format would take 4 MB for.
 	var init *subresourceData
-	if len(pix) >= w*h*bpp {
+	if bpp > 4 && len(pix) >= w*h*bpp {
 		init = &subresourceData{SysMem: uintptr(unsafe.Pointer(&pix[0])), SysMemPitch: uint32(w * bpp)}
 	}
 	if hr := call(r.device, devCreateTexture2D, uintptr(unsafe.Pointer(&desc)), uintptr(unsafe.Pointer(init)), uintptr(unsafe.Pointer(&t.tex))); failed(hr) {
@@ -884,6 +912,9 @@ func (r *Renderer) newTexture(t *texture, w, h int, format uint32, pix []byte, b
 		return fmt.Errorf("d3d11: cannot create a texture view: %#x", uint32(hr))
 	}
 	t.w, t.h = w, h
+	if init == nil && len(pix) >= w*h*bpp {
+		return r.upload(t.tex, format, bpp, 0, 0, w, h, pix, w*bpp)
+	}
 	return nil
 }
 
@@ -901,12 +932,15 @@ func (r *Renderer) syncAtlas(t *texture, a *scene.Atlas, format uint32) error {
 	}
 	rects, full := a.Changes(t.gen, t.ver)
 	if full {
-		call(r.ctx, ctxUpdateSubresource, t.tex, 0, 0, uintptr(unsafe.Pointer(&a.Pix[0])), uintptr(a.W*a.BPP), 0)
+		if err := r.upload(t.tex, format, a.BPP, 0, 0, a.W, a.H, a.Pix, a.W*a.BPP); err != nil {
+			return err
+		}
 	}
 	for _, rc := range rects {
-		b := box{Left: uint32(rc.Min.X), Top: uint32(rc.Min.Y), Front: 0, Right: uint32(rc.Max.X), Bottom: uint32(rc.Max.Y), Back: 1}
 		src := a.Pix[(rc.Min.Y*a.W+rc.Min.X)*a.BPP:]
-		call(r.ctx, ctxUpdateSubresource, t.tex, 0, uintptr(unsafe.Pointer(&b)), uintptr(unsafe.Pointer(&src[0])), uintptr(a.W*a.BPP), 0)
+		if err := r.upload(t.tex, format, a.BPP, rc.Min.X, rc.Min.Y, rc.Dx(), rc.Dy(), src, a.W*a.BPP); err != nil {
+			return err
+		}
 	}
 	t.ver = a.Version()
 	return nil
@@ -939,6 +973,7 @@ func (r *Renderer) imageView(img *scene.Image) uintptr {
 		}
 		t = &texture{}
 		if err := r.newTexture(t, img.W, img.H, formatR8G8B8A8Unorm, pix, 4); err != nil {
+			freeTexture(t)
 			return 0
 		}
 		t.ver = img.Version()
@@ -954,13 +989,45 @@ func (r *Renderer) imageView(img *scene.Image) uintptr {
 		}
 	} else if t.ver != img.Version() {
 		if pix := img.Pixels(); pix != nil {
-			call(r.ctx, ctxUpdateSubresource, t.tex, 0, 0, uintptr(unsafe.Pointer(&pix[0])), uintptr(img.W*4), 0)
+			if r.upload(t.tex, formatR8G8B8A8Unorm, 4, 0, 0, img.W, img.H, pix, img.W*4) != nil {
+				return 0
+			}
 			t.ver = img.Version()
 			img.Uploaded()
 		}
 	}
-	t.lastFrame = r.frame
+	t.lastFrame, t.lastDrawn = r.frame, r.now
 	return t.srv
+}
+
+// MaskTexture returns the view of a texture of a clip mask
+// (gpu.MaskTextures), in A8, which the shaders sample as they sample an
+// image's alpha: tex's refilled, or a new one's.
+func (r *Renderer) MaskTexture(tex uintptr, w, h int, pix []byte) uintptr {
+	if t := r.masks[tex]; t != nil && t.w == w && t.h == h {
+		if r.upload(t.tex, formatA8Unorm, 1, 0, 0, w, h, pix, w) != nil {
+			return 0
+		}
+		return tex
+	}
+	t := &texture{}
+	if err := r.newTexture(t, w, h, formatA8Unorm, pix, 1); err != nil {
+		freeTexture(t)
+		return 0
+	}
+	if r.masks == nil {
+		r.masks = map[uintptr]*texture{}
+	}
+	r.masks[t.srv] = t
+	return t.srv
+}
+
+// FreeMask frees a texture MaskTexture made.
+func (r *Renderer) FreeMask(tex uintptr) {
+	if t := r.masks[tex]; t != nil {
+		freeTexture(t)
+		delete(r.masks, tex)
+	}
 }
 
 // Render draws s into the window and presents it.
@@ -1077,6 +1144,7 @@ func (r *Renderer) draw(s *scene.Scene) error {
 func (r *Renderer) drawFrame(s *scene.Scene) (bool, error) {
 	defer r.releaseShared()
 	r.frame++
+	r.now = time.Now()
 	r.used = 0
 	if err := r.resize(s.Width, s.Height); err != nil {
 		return false, err
@@ -1135,6 +1203,8 @@ func (r *Renderer) drawFrame(s *scene.Scene) (bool, error) {
 		r.diff.Remember(s)
 		r.pipelines.Remember()
 	}
+	r.lastRender, r.trimmed = r.now, false
+	r.armTrim()
 	return true, nil
 }
 
@@ -1211,6 +1281,7 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder, rtv uintptr) error 
 // read, for the render target r.drawing, and returns the scene built.
 func (r *Renderer) buildScene(s *scene.Scene, b *gpu.Builder) (*scene.Scene, error) {
 	b.BlurredImage, b.Chroma = r.blurImage, r.chromaView
+	b.MaskTextures = r // clip masks in A8, a byte a pixel
 	s = b.Build(s, r.imageView)
 	b.BlurredImage, b.Chroma = nil, nil
 	if err := r.syncStops(b); err != nil {
@@ -1890,8 +1961,13 @@ func (r *Renderer) show(sync uintptr) error {
 		// present uncapped again (uncapped.go).
 		r.gaveUp = false
 	}
+	if time.Since(r.sweptAt) >= sweepPeriod && r.frame-r.swept < sweepEvery {
+		// A second since the last sweep, in fewer frames: the sweep alone.
+		r.sweptAt = time.Now()
+		r.sweep()
+	}
 	if r.frame-r.swept >= sweepEvery {
-		r.swept = r.frame
+		r.swept, r.sweptAt = r.frame, time.Now()
 		r.sweep()
 		switch {
 		case !r.uncapped:
@@ -1971,17 +2047,28 @@ func (r *Renderer) FrameInfo() string {
 // it: frames that change nothing count too and present nothing, so an
 // animation that changes every other frame could present none of the
 // multiples, and never sweep.
-const sweepEvery = 120
+//
+// It sweeps sweepPeriod after the last sweep too: a window drawing a couple
+// of frames a second (a caret blinking) sweeps as often as one drawing at
+// every refresh, and a texture no frame drew for unseenFor goes, whatever
+// the frame rate.
+const (
+	sweepEvery  = 120
+	sweepPeriod = time.Second
+	unseenFor   = 2 * time.Second
+)
 
-// sweep frees the textures of images no frame drew for a while, and
-// those of canvases gone, or transient and not drawn this frame.
+// sweep frees the textures of images no frame drew for 240 frames or
+// unseenFor, the staging textures unused for stageIdle, and the textures of
+// canvases gone, or transient and not drawn this frame.
 func (r *Renderer) sweep() {
 	for id, t := range r.images {
-		if r.frame-t.lastFrame > 240 {
+		if r.frame-t.lastFrame > 240 || t.lastFrame != r.frame && r.now.Sub(t.lastDrawn) > unseenFor {
 			freeTexture(t)
 			delete(r.images, id)
 		}
 	}
+	r.dropStages(r.now.Add(-stageIdle))
 	r.sweepShared(false)
 	for id, t := range r.canvases {
 		if c := t.canvas.Value(); c == nil || c.Transient && t.lastFrame != r.frame {

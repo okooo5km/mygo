@@ -74,7 +74,7 @@ func (r *Renderer) surfaceView(img *scene.Image, s *scene.Surface) uintptr {
 		call(r.ctx, ctxUpdateSubresource, t.chroma.tex, 0, 0, uintptr(unsafe.Pointer(&s.Planes[1].Pix[0])), uintptr(s.Planes[1].Stride), 0)
 		t.ver = img.Version()
 	}
-	t.lastFrame = r.frame
+	t.lastFrame, t.lastDrawn = r.frame, r.now
 	return t.srv
 }
 
@@ -131,7 +131,7 @@ func (r *Renderer) sharedView(s *scene.Surface) uintptr {
 		}
 		v.acquired = append(v.acquired, t.mutex)
 	}
-	t.lastFrame = r.frame
+	t.lastFrame, t.lastDrawn = r.frame, r.now
 	return t.srv
 }
 

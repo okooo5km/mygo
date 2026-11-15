@@ -76,8 +76,8 @@ func TestReducedClipCoverageMatchesCPU(t *testing.T) {
 				if err := r.draw(s); err != nil {
 					t.Fatal(err)
 				}
-				if (len(r.images) > 0) != wantMask {
-					t.Fatalf("transform=%v: mask textures=%d, want mask=%t", transform, len(r.images), wantMask)
+				if (len(r.images)+len(r.masks) > 0) != wantMask {
+					t.Fatalf("transform=%v: mask textures=%d, want mask=%t", transform, len(r.images)+len(r.masks), wantMask)
 				}
 				pix, stride, err := r.read()
 				if err != nil {
