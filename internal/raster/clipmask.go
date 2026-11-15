@@ -22,7 +22,24 @@ func ClipMask(dst *scene.Image, clips []scene.ClipShape, area image.Rectangle) *
 	} else if dst.W != w || dst.H != h {
 		dst.Resize(w, h)
 	}
-	m := &clipMasker{dst: dst, area: area, clips: make([]maskClip, len(clips))}
+	clipMask(dst.Pix, 4, clips, area)
+	dst.Changed()
+	return dst
+}
+
+// ClipMaskAlpha is ClipMask into pix, one byte of coverage a pixel, rows
+// of area.Dx() bytes: the same coverage as ClipMask's alpha, a quarter of
+// the memory, for renderers that keep masks in single-channel textures.
+// pix must hold area.Dx()*area.Dy() bytes.
+func ClipMaskAlpha(pix []byte, clips []scene.ClipShape, area image.Rectangle) {
+	clipMask(pix[:area.Dx()*area.Dy()], 1, clips, area)
+}
+
+// clipMask writes the coverage of clips in area into pix, bpp bytes a
+// pixel: RGBA with the coverage in alpha (4), or the coverage alone (1).
+func clipMask(pix []byte, bpp int, clips []scene.ClipShape, area image.Rectangle) {
+	w, h := area.Dx(), area.Dy()
+	m := &clipMasker{pix: pix, bpp: bpp, area: area, clips: make([]maskClip, len(clips))}
 	for i := range clips {
 		c := &clips[i]
 		mc := &m.clips[i]
@@ -54,12 +71,11 @@ func ClipMask(dst *scene.Image, clips []scene.ClipShape, area image.Rectangle) *
 		t.do = m.row
 		t.run(workers, h)
 	}
-	dst.Changed()
-	return dst
 }
 
 type clipMasker struct {
-	dst   *scene.Image
+	pix   []byte
+	bpp   int
 	area  image.Rectangle
 	clips []maskClip
 	// transformed tells that a clip is transformed or masked, so no run
@@ -79,8 +95,8 @@ type maskClip struct {
 
 // row writes row y of the mask, from area.Min.Y.
 func (m *clipMasker) row(_, y int) {
-	w := m.area.Dx()
-	pix := m.dst.Pix[4*y*w:][:4*w]
+	w, n := m.area.Dx(), m.bpp
+	pix := m.pix[n*y*w:][:n*w]
 	fy := y + m.area.Min.Y
 	// [lo, hi) are the frame pixels any clip covers, [slo, shi) those
 	// every clip without a transform covers entirely.
@@ -103,15 +119,21 @@ func (m *clipMasker) row(_, y int) {
 		clear(pix)
 		return
 	}
-	clear(pix[:4*(lo-m.area.Min.X)])
-	clear(pix[4*(hi-m.area.Min.X):])
+	clear(pix[:n*(lo-m.area.Min.X)])
+	clear(pix[n*(hi-m.area.Min.X):])
 	wy := float32(fy) + 0.5
 	for x := lo; x < hi; x++ {
-		at := 4 * (x - m.area.Min.X)
+		at := n * (x - m.area.Min.X)
 		if x >= slo && x < shi && !m.transformed {
 			// Every clip covers the rest of the run entirely.
-			n := 4 * (shi - x)
-			fillAlpha(pix[at:at+n], 255)
+			run := pix[at : at+n*(shi-x)]
+			if n == 1 {
+				for i := range run {
+					run[i] = 255
+				}
+			} else {
+				fillAlpha(run, 255)
+			}
 			x = shi - 1
 			continue
 		}
@@ -130,7 +152,11 @@ func (m *clipMasker) row(_, y int) {
 				break
 			}
 		}
-		pix[at], pix[at+1], pix[at+2], pix[at+3] = 0, 0, 0, to8(cov)
+		if n == 1 {
+			pix[at] = to8(cov)
+		} else {
+			pix[at], pix[at+1], pix[at+2], pix[at+3] = 0, 0, 0, to8(cov)
+		}
 	}
 }
 

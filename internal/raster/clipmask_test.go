@@ -112,3 +112,27 @@ func BenchmarkClipMaskRoundedCard(b *testing.B) {
 		})
 	}
 }
+
+func TestClipMaskAlphaIsClipMasksAlpha(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 7))
+	f := func(lo, hi float32) float32 { return lo + rng.Float32()*(hi-lo) }
+	for range 50 {
+		var clips []scene.ClipShape
+		for range 1 + rng.IntN(3) {
+			c := scene.ClipShape{Rect: scene.Rect{X: f(-10, 60), Y: f(-10, 60), W: f(10, 120), H: f(10, 120)}, Radii: scene.Uniform(f(0, 20)), Continuous: rng.IntN(2) == 0}
+			if rng.IntN(2) == 0 {
+				c.Transform = scene.Translation(f(-5, 5), f(-5, 5)).Mul(scene.Rotation(f(-20, 20)))
+			}
+			clips = append(clips, c)
+		}
+		area := image.Rect(rng.IntN(20)-10, rng.IntN(20)-10, 100+rng.IntN(60), 100+rng.IntN(60))
+		rgba := ClipMask(nil, clips, area)
+		alpha := make([]byte, area.Dx()*area.Dy())
+		ClipMaskAlpha(alpha, clips, area)
+		for i, a := range alpha {
+			if rgba.Pix[4*i+3] != a || rgba.Pix[4*i] != 0 {
+				t.Fatalf("pixel %d: alpha %d, RGBA's %v", i, a, rgba.Pix[4*i:4*i+4])
+			}
+		}
+	}
+}
