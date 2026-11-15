@@ -77,6 +77,7 @@ type (
 )
 
 const (
+	pixelFormatA8Unorm    = 1
 	pixelFormatR8Unorm    = 10
 	pixelFormatRGBA8Unorm = 70
 	pixelFormatBGRA8Unorm = 80
@@ -358,6 +359,8 @@ type texture struct {
 	w, h      int
 	gen, ver  uint64
 	lastFrame uint64
+	// lastDrawn is when the frame that last drew it began.
+	lastDrawn time.Time
 	// gpu marks an image's texture that its GPUSource gave, which shows
 	// memory of its own (an IOSurface): never one to upload pixels into.
 	gpu bool
@@ -483,6 +486,10 @@ type Renderer struct {
 	stopsTex id
 	frame    uint64
 	swept    uint64 // the frame of the last sweep
+	// sweptAt is when the last sweep ran, and now when the frame being
+	// built began, which the textures it draws take as when they were
+	// last drawn.
+	sweptAt, now time.Time
 	// Command buffers retain every resource used by their frame slot.
 	inflight    [ringSize]id
 	slot, inUse int
@@ -1097,8 +1104,30 @@ func (r *Renderer) imageTexture(img *scene.Image) uintptr {
 			img.Uploaded()
 		}
 	}
-	t.lastFrame = r.frame
+	t.lastFrame, t.lastDrawn = r.frame, r.now
 	return t.tex
+}
+
+// rgbaMasks hands clip masks to the renderer as RGBA images, as before
+// A8 masks, for tests that compare the two.
+var rgbaMasks bool
+
+// MaskTexture returns a texture of a clip mask (gpu.MaskTextures): tex
+// refilled, once the frames in flight that read it are done, or a new one,
+// in A8, which the shader samples as it samples an image's alpha.
+func (r *Renderer) MaskTexture(tex uintptr, w, h int, pix []byte) uintptr {
+	if tex != 0 {
+		r.waitLast() // frames in flight read this texture
+		msgReplaceRegion(id(tex), sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), mtlRegion{W: uint(w), H: uint(h), D: 1}, 0, unsafe.Pointer(&pix[0]), uint(w))
+		return tex
+	}
+	return uintptr(r.newTexture(w, h, pixelFormatA8Unorm, usageShaderRead, pix, w))
+}
+
+// FreeMask frees a texture MaskTexture made.
+func (r *Renderer) FreeMask(tex uintptr) {
+	t := id(tex)
+	release(&t)
 }
 
 // gpuTexture returns the texture its GPUSource gives of an image that
@@ -1107,7 +1136,7 @@ func (r *Renderer) imageTexture(img *scene.Image) uintptr {
 func (r *Renderer) gpuTexture(img *scene.Image) uintptr {
 	t := r.images[img.ID()]
 	if t != nil && t.gpu && t.ver == img.Version() && t.w == img.W && t.h == img.H {
-		t.lastFrame = r.frame
+		t.lastFrame, t.lastDrawn = r.frame, r.now
 		return t.tex
 	}
 	tex := id(img.GPU.GPUTexture(scene.Metal, uintptr(r.device)))
@@ -1121,7 +1150,7 @@ func (r *Renderer) gpuTexture(img *scene.Image) uintptr {
 		// The previous frame's, or a texture of its pixels.
 		release(&t.tex)
 	}
-	t.tex, t.w, t.h, t.ver, t.lastFrame, t.gpu = tex, img.W, img.H, img.Version(), r.frame, true
+	t.tex, t.w, t.h, t.ver, t.lastFrame, t.lastDrawn, t.gpu = tex, img.W, img.H, img.Version(), r.frame, r.now, true
 	return t.tex
 }
 
@@ -1196,6 +1225,7 @@ func (r *Renderer) prepare(s *scene.Scene) (cb id, built *scene.Scene, err error
 		return 0, nil, r.err
 	}
 	r.frame++
+	r.now = time.Now()
 	if err := r.syncAtlas(&r.mask, s.MaskAtlas, pixelFormatR8Unorm); err != nil {
 		return 0, nil, err
 	}
@@ -1286,6 +1316,10 @@ func (r *Renderer) drawInto(cb id, s *scene.Scene, target id, d *drawState) erro
 // built.
 func (r *Renderer) build(cb id, s *scene.Scene, d *drawState) (*scene.Scene, error) {
 	d.b.ClipSkip = true
+	d.b.MaskTextures = r // clip masks in A8, a byte a pixel
+	if rgbaMasks {
+		d.b.MaskTextures = nil
+	}
 	d.b.SplitCorners() // only Metal's shader draws continuous corners
 	d.b.BlurredImage = func(img *scene.Image, bk scene.Backdrop) uintptr { return r.blurImage(cb, img, bk) }
 	d.b.Chroma = r.chromaTexture
@@ -2169,26 +2203,38 @@ func (r *Renderer) FrameInfo() string {
 	return info
 }
 
-// sweepEvery is how many frames go by between sweeps.
-const sweepEvery = 120
+// sweepEvery is how many frames go by between sweeps, and sweepPeriod how
+// long at most: a window drawing a couple of frames a second (a caret
+// blinking, a spinner) sweeps as often as one drawing every refresh.
+const (
+	sweepEvery  = 120
+	sweepPeriod = time.Second
+)
 
-// sweepIfDue sweeps once sweepEvery frames went by since the last sweep.
-// Every frame presented calls it, whether render drew it at once or
-// finishPending once its drawable came: frames of an animation mostly
-// take the second way, and counting only the first, they swept seldom if
-// ever, while each frame's transient canvases piled up on the GPU.
+// unseenFor is how long a texture no frame drew stays, whatever the frame
+// rate: textures of what a scroll passed go two seconds after it, rather
+// than after 240 frames, minutes of a caret's (MYGO-UPSTREAM 7 in Clips).
+const unseenFor = 2 * time.Second
+
+// sweepIfDue sweeps once sweepEvery frames went by since the last sweep,
+// or sweepPeriod. Every frame presented calls it, whether render drew it
+// at once or finishPending once its drawable came: frames of an animation
+// mostly take the second way, and counting only the first, they swept
+// seldom if ever, while each frame's transient canvases piled up on the
+// GPU.
 func (r *Renderer) sweepIfDue() {
-	if r.frame-r.swept >= sweepEvery {
-		r.swept = r.frame
+	if r.frame-r.swept >= sweepEvery || time.Since(r.sweptAt) >= sweepPeriod {
+		r.swept, r.sweptAt = r.frame, time.Now()
 		r.sweep()
 	}
 }
 
-// sweep frees the textures of images no frame drew for a while, and
-// those of canvases gone, or transient and not drawn this frame.
+// sweep frees the textures of images no frame drew for 240 frames or for
+// unseenFor, and those of canvases gone, or transient and not drawn this
+// frame.
 func (r *Renderer) sweep() {
 	for key, t := range r.images {
-		if r.frame-t.lastFrame > 240 {
+		if r.frame-t.lastFrame > 240 || t.lastFrame != r.frame && r.now.Sub(t.lastDrawn) > unseenFor {
 			r.dropTexture(t)
 			delete(r.images, key)
 		}

@@ -74,13 +74,13 @@ type videoState struct {
 func (r *Renderer) surfaceTexture(img *scene.Image, s *scene.Surface) id {
 	t := r.images[img.ID()]
 	if t != nil && t.ver == img.Version() && t.w == img.W && t.h == img.H && (t.chroma != 0 || s.Format != scene.SurfaceNV12) {
-		t.lastFrame = r.frame
+		t.lastFrame, t.lastDrawn = r.frame, r.now
 		return t.tex
 	}
 	if s.Native != 0 {
 		if r.wrapSurface(img, s) {
 			t = r.images[img.ID()]
-			t.lastFrame = r.frame
+			t.lastFrame, t.lastDrawn = r.frame, r.now
 			return t.tex
 		}
 		return 0
@@ -109,7 +109,7 @@ func (r *Renderer) surfaceTexture(img *scene.Image, s *scene.Surface) id {
 		msgReplaceRegion(t.chroma, replace, mtlRegion{W: uint(cw), H: uint(ch), D: 1}, 0, unsafe.Pointer(&s.Planes[1].Pix[0]), uint(s.Planes[1].Stride))
 		t.ver = img.Version()
 	}
-	t.lastFrame = r.frame
+	t.lastFrame, t.lastDrawn = r.frame, r.now
 	return t.tex
 }
 
