@@ -59,6 +59,10 @@ const idleMaskPixels = 8 << 20
 // rasterized none.
 const maskScratchKeep = 1 << 20
 
+// maskSlack is how many pixels a mask may cover beyond twice its clip's
+// scissor rectangle (maskPlace): its margin around a small clip.
+const maskSlack = 64 * 64
+
 // maskMargin is how many pixels a mask reaches beyond its clips' bounds:
 // continuous corners antialias up to 3 out (raster.ClipMask), and one more
 // is transparent all round, which sampling beyond the texture repeats.
@@ -334,9 +338,10 @@ func (b *Builder) clipTexture(c *clip, shapes []scene.ClipShape) uintptr {
 // transforming or masking it) and those letting everything through
 // within area are left out: they change nothing where the mask is read.
 // The mask covers what the other shapes can let through, with a margin,
-// rather than area alone, so that it holds as a clip scrolls into view or
-// out of it; unless that is much more than area and than the frame, as for
-// a clip around a long scrolled page, when it covers area alone.
+// rather than area alone, so that it holds as a clip moves within the
+// scissor rectangles; unless that is more than twice area (and
+// maskSlack), as for a clip partly scrolled out of view or around a long
+// page, when it covers area alone.
 func (b *Builder) maskPlace(area image.Rectangle, shapes []scene.ClipShape) (image.Rectangle, []scene.ClipShape) {
 	kept := b.maskShapes[:0]
 	sa := scene.Rect{X: float32(area.Min.X), Y: float32(area.Min.Y), W: float32(area.Dx()), H: float32(area.Dy())}
@@ -365,9 +370,10 @@ func (b *Builder) maskPlace(area image.Rectangle, shapes []scene.ClipShape) (ima
 	if bounds.W > 0 && bounds.H > 0 && bounds.W < 1e6 && bounds.H < 1e6 {
 		own := image.Rect(int(math.Floor(float64(bounds.X)))-maskMargin, int(math.Floor(float64(bounds.Y)))-maskMargin,
 			int(math.Ceil(float64(bounds.X+bounds.W)))+maskMargin, int(math.Ceil(float64(bounds.Y+bounds.H)))+maskMargin)
-		frame := b.stack[0].scissor
-		most := max(4*area.Dx()*area.Dy(), int(frame.Right-frame.Left)*int(frame.Bottom-frame.Top))
-		if own.Dx()*own.Dy() <= most {
+		// Not much more than area: a clip that only peeks into view (a
+		// card at the list's edge) would rasterize all of itself in every
+		// frame it moves by a fraction of a pixel, for the part that shows.
+		if own.Dx()*own.Dy() <= 2*area.Dx()*area.Dy()+maskSlack {
 			place = own
 		}
 	}
