@@ -2,6 +2,7 @@ package ui
 
 import (
 	"math"
+	"sync/atomic"
 
 	"github.com/egoist/mygo/internal/scene"
 	"github.com/egoist/mygo/internal/text"
@@ -25,6 +26,32 @@ import (
 // little smaller (by 9% at most), stay as sharp. The frame in which the
 // scale stops changing asks for one more, which draws them at the scale
 // itself (scaleWatch).
+
+// rasterAtShown is whether text and kept layers rasterize at the scale a
+// transform shows them at (SetRasterAtShownScale).
+var rasterAtShown atomic.Bool
+
+func init() { rasterAtShown.Store(true) }
+
+// SetRasterAtShownScale tells whether text and kept layers (Cache, an
+// opacity's group) under a transform that scales them rasterize at the
+// size they show at, as described above. It is on by default. Off, they
+// rasterize at the window's scale and the transform stretches the result,
+// as before mygo v0.10.0: an animated pose then makes no bucketed or
+// exact-scale redraws and no extra glyph sizes, and takes no more memory
+// for its text and layers than the unscaled element. It applies to frames
+// painted after the call, in every window.
+func SetRasterAtShownScale(on bool) { rasterAtShown.Store(on) }
+
+// shownScale is transformScale, or 1 where SetRasterAtShownScale turned
+// rasterizing at the shown scale off: every caller then takes the path of
+// what no transform scales.
+func shownScale(m scene.Affine, x, y float32) float32 {
+	if !rasterAtShown.Load() {
+		return 1
+	}
+	return transformScale(m, x, y)
+}
 
 // scaleSteps is how many buckets an octave of scales has: 2^(1/8) apart,
 // about 9%, so that a glyph rasterized at its bucket shows at least 92% of
@@ -192,7 +219,7 @@ func (p *Painter) glyphSpaceAt(x, y, size float32, moves bool) glyphSpace {
 	if !m.Set {
 		return gs
 	}
-	k := transformScale(m, x, y)
+	k := shownScale(m, x, y)
 	if unscaled(k) && (p.owner == nil || p.owner.scales == nil) {
 		return gs // turned or moved, as ever: nothing to watch
 	}
@@ -260,7 +287,7 @@ func (p *Painter) layerScale(e *node, from Rect) (q float32, still bool) {
 	if !m.Set || e.effect != nil || e.blur > 0 {
 		return 1, false
 	}
-	k := transformScale(m, e.x+e.w/2, e.y+e.h/2)
+	k := shownScale(m, e.x+e.w/2, e.y+e.h/2)
 	if unscaled(k) && e.st.scales == nil {
 		return 1, false
 	}
