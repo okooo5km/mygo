@@ -1984,3 +1984,23 @@ func isRTL(para []rune, neutral bool) bool {
 	}
 	return neutral
 }
+
+// ReleaseMemory lets go of everything the System can make again, glyph atlases included, which go back to the size
+// of a new System's. Main thread (the atlases are).
+func (s *System) ReleaseMemory() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.eng.(fontForgetter); ok {
+		s.forgetAll(f)
+	}
+	clear(s.masks)
+	clear(s.transient)
+	clear(s.recent)
+	clear(s.outGlyphs)
+	clear(s.outRuns)
+	clear(s.outMasks)
+	s.full = [2]bool{}
+	s.wantSize = [2]image.Point{}
+	s.MaskAtlas.Resize(256, 256)
+	s.ColorAtlas.Resize(1, 1)
+}

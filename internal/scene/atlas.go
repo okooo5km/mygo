@@ -236,3 +236,13 @@ func (a *Atlas) changedAll() {
 	a.version++
 	a.log = a.log[:0]
 }
+
+// Resize empties the atlas and gives it a w×h bitmap, as NewAtlas makes one.
+func (a *Atlas) Resize(w, h int) {
+	a.W, a.H, a.Pix = w, h, make([]byte, w*h*a.BPP)
+	a.shelves, a.transient = nil, nil
+	a.bottom, a.top = 0, h
+	a.log = nil
+	a.gen++
+	a.version++
+}
