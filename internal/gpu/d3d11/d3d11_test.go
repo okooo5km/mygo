@@ -314,7 +314,7 @@ func releaseImages(s *scene.Scene, restores, drops *int) int {
 // the renderer: an image whose pixels an owner dropped uploads them again
 // from the restore, drawing as before, as a renderer that lost or evicted
 // its texture does. The first draw takes the new-texture path, which an
-// eviction after 240 frames takes too.
+// eviction after unseenFor takes too.
 func TestReleasedImageUploadsFromItsRestore(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

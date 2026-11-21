@@ -2059,12 +2059,15 @@ const (
 	unseenFor   = 2 * time.Second
 )
 
-// sweep frees the textures of images no frame drew for 240 frames or
-// unseenFor, the staging textures unused for stageIdle, and the textures of
-// canvases gone, or transient and not drawn this frame.
+// sweep frees the textures of images no frame drew for unseenFor, the
+// staging textures unused for stageIdle, and the textures of canvases gone,
+// or transient and not drawn this frame. Images go by time only: a count of
+// frames went sooner at a high refresh rate (240 frames are 1 s at 240 Hz),
+// before an owner that re-decodes a picture away from the draw counts its
+// texture as gone (MYGO-UPSTREAM in Clips).
 func (r *Renderer) sweep() {
 	for id, t := range r.images {
-		if r.frame-t.lastFrame > 240 || t.lastFrame != r.frame && r.now.Sub(t.lastDrawn) > unseenFor {
+		if t.lastFrame != r.frame && r.now.Sub(t.lastDrawn) > unseenFor {
 			freeTexture(t)
 			delete(r.images, id)
 		}
