@@ -261,6 +261,11 @@ type Builder struct {
 	// continuous corners (SplitCorners), which analyticClip may then
 	// leave to it rather than to a mask.
 	contClips bool
+	// NoSimilarClips keeps a clip under a uniform scale and a move
+	// transformed, cut with a mask, as a renderer that does not cut
+	// continuous corners has it, and shares no side of a hard clip with a
+	// rounded one (a reference for tests).
+	NoSimilarClips bool
 	// bands are the bands planBands planned last, and bandsTry its scratch.
 	bands, bandsTry []band
 	// NoClasses puts every batch in ClassGeneral, for tests and
@@ -440,8 +445,13 @@ type clip struct {
 	// (scene.ClipShape.Masks), which the shaders don't evaluate.
 	moved, masks bool
 	masked       bool
-	maskSlot     int
-	maskTexture  uintptr
+	// posed tells that this clip or one it is nested in was pushed under a
+	// uniform scale and a move, and is a clip in the frame's coordinates
+	// (scene.SimilarClipOp). Its drawing is cut by analyticClip, which
+	// lets such clips share the pixels of their edges.
+	posed       bool
+	maskSlot    int
+	maskTexture uintptr
 	// maskArea are the frame pixels the clip's mask covers, with
 	// maskTexture.
 	maskArea image.Rectangle
@@ -451,6 +461,14 @@ type clip struct {
 // without a mask slot or texture.
 func (b *Builder) pushed(s *scene.Scene, top *clip, op *scene.Op, i int) clip {
 	shape := scene.ClipShapeOf(op, s.Stops)
+	posed := top.posed
+	if b.contClips && !b.NoSimilarClips && scene.SimilarClip(op) {
+		// Only Metal's shader cuts continuous corners, and so lets a
+		// posed card's clip be one: other renderers keep the mask of the
+		// transformed clip.
+		shape = scene.SimilarClipShapeOf(op, s.Stops)
+		posed = !shape.Transform.Set
+	}
 	rect, transform := shape.Rect, shape.Transform
 	bounds := top.bounds.Intersect(transform.Bounds(rect))
 	// The innermost clip shapes its edges in the shader, the others cut
@@ -458,10 +476,10 @@ func (b *Builder) pushed(s *scene.Scene, top *clip, op *scene.Op, i int) clip {
 	// and those inside it, with a mask of the clips, as a clip reaching
 	// into the rounded corners of one around it, which is then masked too
 	// (markEnclosing).
-	c := clip{rect: rect, radii: scene.Corners(rect, op.Radii, op.Continuous), bounds: bounds, shape: shape, maskSlot: -1}
+	c := clip{rect: rect, radii: scene.Corners(rect, shape.Radii, shape.Continuous), bounds: bounds, shape: shape, maskSlot: -1, posed: posed}
 	c.moved = top.moved || transform.Set
 	c.masks = top.masks || shape.Masks()
-	c.masked = c.moved || c.masks || b.cuts[i] || b.encloses[i] && (top.masked || c.radii != [4]float32{})
+	c.masked = c.moved || c.masks || c.posed || b.cuts[i] || b.encloses[i] && (top.masked || c.radii != [4]float32{})
 	if bounds.W > 0 && bounds.H > 0 {
 		c.scissor = Scissor{int32(math.Floor(float64(bounds.X))), int32(math.Floor(float64(bounds.Y))),
 			int32(math.Ceil(float64(bounds.X + bounds.W))), int32(math.Ceil(float64(bounds.Y + bounds.H)))}

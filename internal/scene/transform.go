@@ -27,7 +27,18 @@ type ClipShape struct {
 // ClipShapeOf returns the shape of op, an OpPushClip of a scene with
 // stops, moved as MovedClipOp moves it: its Stops are a part of stops.
 func ClipShapeOf(op *Op, stops []Stop) ClipShape {
-	o := MovedClipOp(op)
+	return clipShapeOf(MovedClipOp(op), stops)
+}
+
+// SimilarClipShapeOf is ClipShapeOf for a renderer that cuts a rounded
+// rectangle in the frame's coordinates (SimilarClipOp): a clip pushed
+// under a uniform scale and a move comes back as the rectangle it is in
+// the frame, without a transform.
+func SimilarClipShapeOf(op *Op, stops []Stop) ClipShape {
+	return clipShapeOf(SimilarClipOp(op), stops)
+}
+
+func clipShapeOf(o Op, stops []Stop) ClipShape {
 	c := ClipShape{Rect: o.Rect, Radii: o.Radii, Transform: o.Transform, Continuous: o.Continuous}
 	if o.Paint != PaintSolid {
 		c.Paint, c.Gradient, c.Color, c.Color2 = o.Paint, o.Gradient, o.Color, o.Color2
@@ -143,6 +154,47 @@ func MovedClipOp(op *Op) Op {
 	o.Rect, o.Transform = r, Affine{}
 	o.moveGradient(dx, dy)
 	return o
+}
+
+// similarity returns the factor of m when m is a uniform scale and a move:
+// A == D > 0, no turn or skew (B == C == 0), no perspective.
+func (m Affine) similarity() (float32, bool) {
+	if !m.Set || m.Behind || m.G != 0 || m.H != 0 || m.B != 0 || m.C != 0 || m.A != m.D || !(m.A > 0) || math.IsInf(float64(m.A), 0) {
+		return 0, false
+	}
+	return m.A, true
+}
+
+// SimilarClipOp is MovedClipOp for a clip under a uniform scale and a move
+// too (a card lifting or hovered under a pose, whose drawing is scaled
+// about its center): a rounded rectangle under it is a rounded rectangle
+// in the frame, its rectangle scaled and moved, its radii scaled, its
+// corners as continuous or as circular as they were. A clip masked by a
+// gradient or an image, or under any other transform, is left as it is.
+func SimilarClipOp(op *Op) Op {
+	o := MovedClipOp(op)
+	k, ok := o.Transform.similarity()
+	if !ok || o.Paint != PaintSolid || o.Image != nil {
+		return o
+	}
+	m := o.Transform
+	o.Rect = Rect{X: k*o.Rect.X + m.X, Y: k*o.Rect.Y + m.Y, W: k * o.Rect.W, H: k * o.Rect.H}
+	for i := range o.Radii {
+		o.Radii[i] *= k
+	}
+	o.Transform = Affine{}
+	return o
+}
+
+// SimilarClip reports whether op, an OpPushClip, is transformed by a
+// uniform scale other than 1 and a move, and is then a rectangle in the
+// frame by SimilarClipOp. A move alone is MovedClip's.
+func SimilarClip(op *Op) bool {
+	if op.Kind != OpPushClip || !op.Transform.Set || op.Paint != PaintSolid || op.Image != nil {
+		return false
+	}
+	k, ok := op.Transform.similarity()
+	return ok && k != 1
 }
 
 // moveGradient moves the points of the op's gradient by (x, y); stripes

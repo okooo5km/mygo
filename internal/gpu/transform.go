@@ -141,8 +141,15 @@ func (b *Builder) prepare(in *Instance, m scene.Affine, c *clip) bool {
 // Overlapping antialiased edges still need their multiplied pixel mask.
 func (b *Builder) analyticClip() (clip, bool) {
 	var rounded, hard *clip
+	var merged clip
 	sc := b.stack[len(b.stack)-1].scissor
 	area := scene.Rect{X: float32(sc.Left), Y: float32(sc.Top), W: float32(sc.Right - sc.Left), H: float32(sc.Bottom - sc.Top)}
+	// On Metal, a card's clips have fractional edges, posed (clip.posed) or
+	// scrolled by a fraction of a pixel, and the body in it shares the
+	// card's sides: the mask multiplies their coverage, and the shader
+	// takes it once. A side no tighter than the card's is the card's;
+	// several hard clips are one rectangle where their sides agree.
+	loose := b.contClips && !b.NoSimilarClips
 	for i := range b.stack {
 		c := &b.stack[i]
 		// Only Metal's shader evaluates continuous corners (SplitCorners):
@@ -159,16 +166,27 @@ func (b *Builder) analyticClip() (clip, bool) {
 		if clipOpaqueWithin(c, area) {
 			continue
 		}
-		if c.radii != [4]float32{} {
+		switch {
+		case c.radii != [4]float32{}:
 			if rounded != nil {
 				return clip{}, false
 			}
 			rounded = c
-		} else {
-			if hard != nil {
+		case hard == nil:
+			hard = c
+		case !loose:
+			return clip{}, false
+		default:
+			// Hard clips are rectangles: the intersection of several is
+			// one, where no two sides differ within a pixel.
+			if !sidesAgree(hard.rect, c.rect) {
 				return clip{}, false
 			}
-			hard = c
+			merged = clip{rect: hard.rect.Intersect(c.rect)}
+			if merged.rect.W <= 0 || merged.rect.H <= 0 {
+				return clip{}, false
+			}
+			hard = &merged
 		}
 	}
 	if rounded == nil {
@@ -178,9 +196,28 @@ func (b *Builder) analyticClip() (clip, bool) {
 		return clip{rect: area}, true
 	}
 	if hard != nil {
-		return intersectAnalyticClip(*rounded, hard.rect)
+		return intersectAnalyticClip(*rounded, hard.rect, loose)
 	}
 	return *rounded, true
+}
+
+// sharedEdge is how far apart two edges may be to be the same one.
+const sharedEdge = 1e-3
+
+// sidesAgree reports whether no side of a differs from b's by more than
+// sharedEdge within one pixel: those are antialiased by both, and a mask
+// multiplies their coverage.
+func sidesAgree(a, b scene.Rect) bool {
+	ae, be := [4]float32{a.X, a.Y, a.X + a.W, a.Y + a.H}, [4]float32{b.X, b.Y, b.X + b.W, b.Y + b.H}
+	for i := range ae {
+		if d := ae[i] - be[i]; d <= sharedEdge && d >= -sharedEdge {
+			continue
+		}
+		if i < 2 && math.Floor(float64(ae[i])) == math.Floor(float64(be[i])) || i >= 2 && math.Ceil(float64(ae[i])) == math.Ceil(float64(be[i])) {
+			return false
+		}
+	}
+	return true
 }
 
 func integerClip(r scene.Rect) bool {
@@ -237,23 +274,41 @@ func clipOpaqueWithin(c *clip, area scene.Rect) bool {
 // intersectAnalyticClip trims away whole corners, as a fractional lyrics
 // viewport trims its player card. Cutting a curve or multiplying partial
 // coverages cannot be represented by a single rounded rectangle.
-func intersectAnalyticClip(c clip, hard scene.Rect) (clip, bool) {
-	r := c.rect.Intersect(hard)
-	if r.W < 1 || r.H < 1 {
-		return clip{}, false
-	}
+//
+// Loose is for renderers that cut continuous corners (Metal): a side of the
+// hard clip that shares its pixel with the card's and is no tighter than
+// it (the body's sides are the card's), is the card's alone, which the
+// shader antialiases once where the mask multiplies the two. A tighter
+// one in that pixel still needs the mask.
+func intersectAnalyticClip(c clip, hard scene.Rect, loose bool) (clip, bool) {
 	before := [4]float32{c.rect.X, c.rect.Y, c.rect.X + c.rect.W, c.rect.Y + c.rect.H}
-	after := [4]float32{r.X, r.Y, r.X + r.W, r.Y + r.H}
 	edges := [4]float32{hard.X, hard.Y, hard.X + hard.W, hard.Y + hard.H}
+	after := before
 	for i, edge := range edges {
 		old := float64(before[i])
+		var shared bool
 		if i < 2 {
-			if edge <= before[i] && float64(edge) > math.Floor(old) || edge > before[i] && math.Floor(float64(edge)) < math.Ceil(old) {
-				return clip{}, false
-			}
-		} else if edge >= before[i] && float64(edge) < math.Ceil(old) || edge < before[i] && math.Ceil(float64(edge)) > math.Floor(old) {
-			return clip{}, false
+			shared = edge <= before[i] && float64(edge) > math.Floor(old) || edge > before[i] && math.Floor(float64(edge)) < math.Ceil(old)
+		} else {
+			shared = edge >= before[i] && float64(edge) < math.Ceil(old) || edge < before[i] && math.Ceil(float64(edge)) > math.Floor(old)
 		}
+		switch {
+		case shared && loose && (i < 2 && edge <= before[i]+sharedEdge || i >= 2 && edge >= before[i]-sharedEdge):
+			// the hard edge is as loose as the card's, or the same:
+			// the card's edge stands
+		case shared:
+			// a tighter edge in the pixel of the card's, which only
+			// the product of the two coverages gets right
+			return clip{}, false
+		case i < 2:
+			after[i] = max(before[i], edge)
+		default:
+			after[i] = min(before[i], edge)
+		}
+	}
+	r := scene.Rect{X: after[0], Y: after[1], W: after[2] - after[0], H: after[3] - after[1]}
+	if r.W < 1 || r.H < 1 {
+		return clip{}, false
 	}
 	pixels := scene.Rect{X: float32(math.Floor(float64(r.X))), Y: float32(math.Floor(float64(r.Y)))}
 	pixels.W, pixels.H = float32(math.Ceil(float64(r.X+r.W)))-pixels.X, float32(math.Ceil(float64(r.Y+r.H)))-pixels.Y

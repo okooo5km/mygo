@@ -283,6 +283,13 @@ func Scene() *scene.Scene {
 // MYGO_GPU_PNG naming a directory, it saves both images there.
 func Compare(t testing.TB, name string, got []byte, stride int, s *scene.Scene) {
 	t.Helper()
+	CompareWithin(t, name, got, stride, s, 24)
+}
+
+// CompareWithin is Compare, failing for a pixel off by more than most
+// (24 for Compare).
+func CompareWithin(t testing.TB, name string, got []byte, stride int, s *scene.Scene, most int) {
+	t.Helper()
 	want := raster.NewImage(s.Width, s.Height)
 	raster.Render(want, s)
 	worst, off := 0, 0
@@ -310,7 +317,7 @@ func Compare(t testing.TB, name string, got []byte, stride int, s *scene.Scene) 
 	}
 	// One pixel in two hundred may differ by more than 2 of 255, none by
 	// more than 24.
-	if worst > 24 || off*200 > s.Width*s.Height {
+	if worst > most || off*200 > s.Width*s.Height {
 		t.Errorf("%s: %d pixels differ from the CPU renderer's by more than 2, the most by %d at %v", name, off, worst, worstAt)
 	}
 }
