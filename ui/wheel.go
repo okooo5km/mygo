@@ -6,9 +6,26 @@ import (
 	"time"
 )
 
-// wheelAnimation is how the notches of a mouse wheel scroll: along a short
-// ease out, as browsers scroll them, rather than the whole notch at once.
-var wheelAnimation = Animation{Duration: 150 * time.Millisecond, Ease: EaseOut}
+// wheelRate is the rate, in 1/s, of the critically damped spring that the
+// notches of a mouse wheel scroll on: a lone notch covers 90 % of its way
+// in about 140 ms and rests (within wheelPrecision) in about 300 ms.
+const wheelRate = 28
+
+// wheelPrecision is how close, in DIPs, a notch's glide rests at its end.
+const wheelPrecision = 0.1
+
+// wheelAnimation is how the notches of a mouse wheel scroll: on a
+// critically damped spring, which does not overshoot and, retargeted by
+// the next notch, keeps its velocity, so that a wheel turning steadily
+// scrolls steadily. A curve restarted at every notch, as it was, starts
+// over at its fastest, and the content went by 10, 17 and 13 px a frame
+// in turn at 50 ms between notches.
+var wheelAnimation = Animation{Spring: SpringOptions{
+	Mass:      1,
+	Stiffness: wheelRate * wheelRate,
+	Damping:   2 * wheelRate,
+	Precision: wheelPrecision,
+}}
 
 // wheelGlide is the notches of a wheel on their way through a scroll
 // container: x and y go from 0 to as far as all of them scroll, and done

@@ -43,7 +43,7 @@ func TestChartZoomsAndPans(t *testing.T) {
 	tt.Frame()
 
 	tt.Wheel(50, 130, 0, -40)
-	tt.Advance(wheelAnimation.Duration)
+	tt.Advance(wheelSettle)
 	if scale != 1.25 || page.Y != 0 {
 		t.Errorf("a notch up zoomed to %v and scrolled the page to %v, want 1.25 and 0", scale, page.Y)
 	}
