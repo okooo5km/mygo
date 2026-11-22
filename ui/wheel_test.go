@@ -427,3 +427,55 @@ func TestScrollToWheelAnimationSteadySpeed(t *testing.T) {
 		}
 	}
 }
+
+// Stop ends a ScrollTo where the container is, and the next one starts at
+// rest: a ScrollTo back does not go on a while the way the one stopped did.
+func TestScrollStop(t *testing.T) {
+	var s ScrollState
+	tt := coreNewTester(func(c *context) {
+		coreScroll(c).Fill().TrackScroll(&s).Children(func() {
+			coreBox(c).Height(100000).Shrink(0)
+		})
+	}, 200, 200)
+	tt.Move(100, 100)
+	tt.Frame()
+	frame := 16667 * time.Microsecond
+	to := 0.0
+	for i := 0; i < 5; i++ {
+		to += 40
+		s.ScrollTo(0, float32(to), WheelAnimation)
+		tt.Frame()
+		tt.Advance(20 * time.Millisecond)
+	}
+	if !s.Scrolling() {
+		t.Fatal("setup: no glide on its way")
+	}
+	at := s.Y
+	s.Stop()
+	if s.Scrolling() {
+		t.Fatal("still scrolling after Stop")
+	}
+	tt.Advance(300 * time.Millisecond)
+	if s.Y != at {
+		t.Fatalf("moved from %v to %v after Stop", at, s.Y)
+	}
+	// An offset set after Stop holds: the glide does not take it over.
+	s.Y = at + 10
+	tt.Advance(300 * time.Millisecond)
+	if s.Y != at+10 {
+		t.Fatalf("Y set after Stop is %v, want %v", s.Y, at+10)
+	}
+	// A ScrollTo back starts at rest: it never goes the old way again.
+	s.ScrollTo(0, s.Y-40, WheelAnimation)
+	tt.Frame()
+	top := s.Y
+	for i := 0; i < 60; i++ {
+		tt.Advance(frame)
+		if s.Y > top {
+			t.Fatalf("frame %d: went on the old way, %v > %v", i, s.Y, top)
+		}
+	}
+	if s.Y != top-40 {
+		t.Errorf("rests at %v, want %v", s.Y, top-40)
+	}
+}

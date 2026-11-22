@@ -1,5 +1,7 @@
 package ui
 
+import "math"
+
 // ScrollState is how far a scroll container scrolls its content, kept in
 // the app's state with TrackScroll.
 type ScrollState struct {
@@ -48,6 +50,14 @@ func (s *ScrollState) ScrollTo(x, y float32, a Animation) {
 	}
 	s.glide.to, s.glide.a, s.glide.moved = [2]float32{x, y}, a, true
 }
+
+// Stop ends a ScrollTo on its way: the container stays where it shows its
+// content, at rest, and the next ScrollTo starts from there with none of
+// the speed of the one stopped, as a notch of a wheel turned against the
+// glide does. Setting X or Y while a ScrollTo is on its way does not stop
+// it: the glide takes the offset over again at the next frame, so call Stop
+// first. It does nothing with none on its way.
+func (s *ScrollState) Stop() { s.glide = nil }
 
 // Scrolling reports whether a ScrollTo is on its way.
 func (s *ScrollState) Scrolling() bool { return s.glide != nil }
@@ -189,9 +199,19 @@ func (e *node) adoptScroll() bool {
 func (e *node) glide(t *ScrollState) {
 	g, st, rt, now := t.glide, e.st, e.c.rt, e.c.now
 	if !g.placed || g.frame+1 < rt.frame {
-		// Starting, or the container was not shown: from where it shows.
-		g.x = channel{value: st.scrollX, target: st.scrollX, at: now}
-		g.y = channel{value: st.scrollY, target: st.scrollY, at: now}
+		// Starting, or the container was not shown: from where it shows,
+		// or from the offset the app set meanwhile (X and Y, not yet taken
+		// by the container), so that setting X and calling ScrollTo in one
+		// build glides from X.
+		x, y := st.scrollX, st.scrollY
+		if t.X != float32(x) && t.X < math.MaxFloat32 {
+			x = float64(t.X)
+		}
+		if t.Y != float32(y) && t.Y < math.MaxFloat32 {
+			y = float64(t.Y)
+		}
+		g.x = channel{value: x, target: x, at: now}
+		g.y = channel{value: y, target: y, at: now}
 		g.placed, g.moved = true, true
 	}
 	g.frame = rt.frame
