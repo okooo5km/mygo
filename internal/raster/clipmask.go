@@ -125,8 +125,27 @@ func (m *clipMasker) row(_, y int) {
 	clear(pix[:n*(lo-m.area.Min.X)])
 	clear(pix[n*(hi-m.area.Min.X):])
 	wy := float32(fy) + 0.5
+	// [flo, fhi) are the pixels where every clip's coverage is 1 and what
+	// the masks let through is the same, rowAlpha, for a row of a transformed
+	// or masked clip too (rowSpan).
+	flo, fhi, rowAlpha := 0, 0, float32(1)
+	if m.transformed && !noRowSpans {
+		flo, fhi, rowAlpha = m.rowSpan(fy, wy, lo, hi, slo, shi)
+	}
 	for x := lo; x < hi; x++ {
 		at := n * (x - m.area.Min.X)
+		if x >= flo && x < fhi {
+			run := pix[at : at+n*(fhi-x)]
+			if v := to8(rowAlpha); n == 1 {
+				for i := range run {
+					run[i] = v
+				}
+			} else {
+				fillAlpha(run, v)
+			}
+			x = fhi - 1
+			continue
+		}
 		if x >= slo && x < shi && !m.transformed {
 			// Every clip covers the rest of the run entirely.
 			run := pix[at : at+n*(shi-x)]
@@ -259,4 +278,56 @@ func imageMaskCopy(pix []byte, bpp int, c *scene.ClipShape, area image.Rectangle
 		}
 	}
 	return true
+}
+
+// noRowSpans turns rowSpan off, for tests that compare the two.
+var noRowSpans bool
+
+// rowSpan returns the pixels [flo, fhi) of row fy, within [lo, hi), where
+// the clips cover every pixel entirely, those without a transform in
+// [slo, shi) among them, and the alpha, the same for all of them, that
+// their gradient masks let through. It returns an empty span when a clip
+// is not simple enough: a transformed one that turns or leans (its pixels
+// map to the clip at an angle), a mask of an image, and a gradient that
+// changes along the row (a linear one that changes along x). A scaled and
+// moved clip, as a lifted card is, with a gradient fading it from its top
+// to its bottom, takes a pixel only where it covers the edges.
+func (m *clipMasker) rowSpan(fy int, wy float32, lo, hi, slo, shi int) (int, int, float32) {
+	flo, fhi, alpha := max(lo, slo), min(hi, shi), float32(1)
+	for i := range m.clips {
+		c := &m.clips[i]
+		if c.masked && (c.mask.img != nil || !c.mask.paint.constantAlongX()) {
+			return 0, 0, 1
+		}
+		if !c.transform.Set && !c.masked {
+			continue // [slo, shi)
+		}
+		t, inv := c.transform, c.inverse
+		var a, b int
+		if t.Set {
+			if t.B != 0 || t.C != 0 || t.G != 0 || t.H != 0 || t.A <= 0 || t.D <= 0 || t.Behind ||
+				inv.B != 0 || inv.C != 0 || inv.G != 0 || inv.H != 0 {
+				return 0, 0, 1
+			}
+			// The row's local extent, one pixel's margin more each side.
+			y0, y1 := inv.D*(float32(fy)-1)+inv.Y, inv.D*(float32(fy)+2)+inv.Y
+			la, lb := solidSpan(&c.shape, y0, y1)
+			if lb <= la {
+				return 0, 0, 1
+			}
+			a = int(math.Ceil(float64(t.A*float32(la)+t.X))) + 1
+			b = int(math.Floor(float64(t.A*float32(lb)+t.X))) - 1
+		} else {
+			a, b = solidSpan(&c.shape, float32(fy), float32(fy+1))
+		}
+		flo, fhi = max(flo, a), min(fhi, b)
+		if flo >= fhi {
+			return 0, 0, 1
+		}
+		if c.masked {
+			wx := float32(flo) + 0.5
+			alpha *= c.mask.atFrame(c.transform, c.inverse, wx, wy)
+		}
+	}
+	return flo, fhi, alpha
 }

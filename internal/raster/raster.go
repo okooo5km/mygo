@@ -847,6 +847,19 @@ func (p *painter) visible() bool {
 	return p.c1[3] > 0 || (!p.solid() && p.c2[3] > 0)
 }
 
+// constantAlongX reports whether the fill is the same along a row of pixels
+// at any place, so that one pixel's tells it all: a linear gradient
+// that changes only from one row to the next (its direction is vertical).
+func (p *painter) constantAlongX() bool {
+	switch p.paint {
+	case scene.PaintSolid:
+		return true
+	case scene.PaintLinearStops, scene.PaintLinearStopsOklab, scene.PaintLinear:
+		return p.g[2] == p.g[0]
+	}
+	return false
+}
+
 // at returns the fill at a pixel center.
 func (p *painter) at(px, py float32) [4]float32 {
 	switch p.paint {
