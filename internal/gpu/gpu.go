@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/scene"
@@ -336,9 +337,12 @@ type Builder struct {
 	// MasksDrawn and MaskPixels are how many clip masks the last Build
 	// rasterized, and their pixels; MasksReused how many it found made.
 	MasksDrawn, MaskPixels, MasksReused int
-	frame                               uint64
-	imageTexture                        func(*scene.Image) uintptr
-	preparedMask                        uintptr
+	// MaskTime is how long the last Build spent making masks, MaskRaster
+	// of it rasterizing them, measured while Timing is set.
+	MaskTime, MaskRaster time.Duration
+	frame                uint64
+	imageTexture         func(*scene.Image) uintptr
+	preparedMask         uintptr
 	// Chroma, unless nil, returns the texture of the chroma of an image
 	// showing a frame in NV12 (scene.SurfaceNV12), after the image's
 	// texture, its luma, was asked for: renderers that sample such frames
@@ -503,6 +507,7 @@ func (b *Builder) Build(s *scene.Scene, image func(*scene.Image) uintptr) *scene
 	b.imageTexture = image
 	b.maskUsed = 0
 	b.MasksDrawn, b.MaskPixels, b.MasksReused = 0, 0, 0
+	b.MaskTime, b.MaskRaster = 0, 0
 	b.frame++
 	b.clipShapes = b.clipShapes[:0]
 	b.Instances = b.Instances[:0]
@@ -1237,6 +1242,9 @@ func (b *Builder) addMaskedEffect(s *scene.Scene, op *scene.Op, fx *scene.Effect
 		b.Batches = append(b.Batches, batch)
 	}
 }
+
+// Timing turns on the measures MYGO_FRAME_STATS reads.
+var Timing bool
 
 // addInstances is Builder.addInstances once EnableInstances was called.
 var addInstances atomic.Pointer[func(b *Builder, op *scene.Op, fx *scene.EffectOp, cur *clip)]

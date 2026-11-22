@@ -5,6 +5,7 @@ import (
 	"image"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/egoist/mygo/internal/raster"
 	"github.com/egoist/mygo/internal/scene"
@@ -495,6 +496,10 @@ func (b *Builder) rasterize(m *clipMaskSlot, mw, mh int) bool {
 	b.MasksDrawn++
 	b.MaskPixels += n
 	b.maskDrawn = true
+	if Timing {
+		t0 := time.Now()
+		defer func() { b.MaskTime += time.Since(t0) }()
+	}
 	if b.MaskTextures == nil {
 		if m.image == nil {
 			m.image = scene.NewImageRGBA(mw, mh, make([]byte, 4*n))
@@ -509,7 +514,14 @@ func (b *Builder) rasterize(m *clipMaskSlot, mw, mh int) bool {
 		b.maskPix = make([]byte, n)
 	}
 	pix := b.maskPix[:n]
+	var r0 time.Time
+	if Timing {
+		r0 = time.Now()
+	}
 	raster.ClipMaskAlpha(pix, m.shapes, image.Rect(0, 0, mw, mh))
+	if Timing {
+		b.MaskRaster += time.Since(r0)
+	}
 	had := m.tex
 	if m.w != mw || m.h != mh {
 		had = 0

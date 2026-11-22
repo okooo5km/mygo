@@ -20,5 +20,8 @@ func (b *Builder) Summary() string {
 	if b.MasksDrawn > 0 || b.MasksReused > 0 {
 		s += fmt.Sprintf(", clip masks %d rasterized (%d px), %d reused", b.MasksDrawn, b.MaskPixels, b.MasksReused)
 	}
+	if Timing {
+		s += fmt.Sprintf(", masks took %.2f ms, of it raster %.2f", b.MaskTime.Seconds()*1000, b.MaskRaster.Seconds()*1000)
+	}
 	return s
 }

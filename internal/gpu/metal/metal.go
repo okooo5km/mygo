@@ -515,6 +515,8 @@ type Renderer struct {
 	ages   gpu.Ages
 	redrew redrawn
 	part   gpu.Part
+	// dbg measures the present, nil unless MYGO_FRAME_STATS is set.
+	dbg *frameDiag
 	// pipelines has a hash of the pipelines each op draws with (see
 	// pipelineDamage).
 	pipelines gpu.Pipelines
@@ -602,7 +604,7 @@ func newRenderer() (r *Renderer, err error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
-	r = &Renderer{images: map[uint64]*texture{}, sweptAt: time.Now()}
+	r = &Renderer{images: map[uint64]*texture{}, sweptAt: time.Now(), dbg: newFrameDiag()}
 	// The GPU's quads reach a pixel out of their shapes, glyphs half a
 	// pixel more, as they draw at whole pixels.
 	r.diff.Reach = 2
@@ -1169,7 +1171,16 @@ func (r *Renderer) waitSlot(slot int) {
 	if cb == 0 {
 		return
 	}
+	var t0 time.Time
+	if r.dbg != nil {
+		t0 = time.Now()
+	}
 	send(cb, "waitUntilCompleted")
+	if r.dbg != nil {
+		r.dbg.wait += time.Since(t0)
+		r.dbg.gpuWait = time.Since(t0)
+		r.dbg.gpu = time.Duration((msgDouble(cb, uintptr(sel("GPUEndTime"))) - msgDouble(cb, uintptr(sel("GPUStartTime")))) * float64(time.Second))
+	}
 	if int(send(cb, "status")) == statusError && r.err == nil {
 		e := send(cb, "error")
 		r.err = fmt.Errorf("metal: a frame failed: %s", describe(e))
@@ -1234,6 +1245,11 @@ func (r *Renderer) prepare(s *scene.Scene) (cb id, built *scene.Scene, err error
 	}
 	r.pipes.fallbacks = 0
 	r.used = 0
+	var p0 time.Time
+	if r.dbg != nil {
+		p0 = time.Now()
+		defer func() { r.dbg.prepare += time.Since(p0) }()
+	}
 	cb = send(r.queue, "commandBuffer")
 	if !r.checked {
 		if err := need(cb, "command buffer", "renderCommandEncoderWithDescriptor:", "commit", "presentDrawable:", "waitUntilScheduled", "waitUntilCompleted", "status", "blitCommandEncoder"); err != nil {
@@ -1244,6 +1260,9 @@ func (r *Renderer) prepare(s *scene.Scene) (cb id, built *scene.Scene, err error
 	s.EachCanvas(func(c *scene.Image) {
 		if err == nil {
 			err = r.drawCanvas(cb, c)
+			if r.dbg != nil {
+				r.dbg.canvases++
+			}
 		}
 	})
 	if err != nil {
@@ -1323,8 +1342,16 @@ func (r *Renderer) build(cb id, s *scene.Scene, d *drawState) (*scene.Scene, err
 	d.b.SplitCorners() // only Metal's shader draws continuous corners
 	d.b.BlurredImage = func(img *scene.Image, bk scene.Backdrop) uintptr { return r.blurImage(cb, img, bk) }
 	d.b.Chroma = r.chromaTexture
+	var b0 time.Time
+	if r.dbg != nil {
+		b0 = time.Now()
+	}
 	s = d.b.Build(s, r.imageTexture)
 	d.b.BlurredImage, d.b.Chroma = nil, nil
+	if r.dbg != nil {
+		r.dbg.build += time.Since(b0)
+		b0 = time.Now()
+	}
 	if err := r.syncStops(d); err != nil {
 		return nil, err
 	}
@@ -1347,6 +1374,10 @@ func (r *Renderer) build(cb id, s *scene.Scene, d *drawState) (*scene.Scene, err
 	if err := r.fitBackdrop(&d.b); err != nil {
 		return nil, err
 	}
+	if r.dbg != nil {
+		r.dbg.upload += time.Since(b0)
+		b0 = time.Now()
+	}
 	d.pipes = d.pipes[:0]
 	for _, b := range d.b.Batches {
 		var pipe id
@@ -1354,6 +1385,9 @@ func (r *Renderer) build(cb id, s *scene.Scene, d *drawState) (*scene.Scene, err
 			pipe = r.batchPipe(b)
 		}
 		d.pipes = append(d.pipes, pipe)
+	}
+	if r.dbg != nil {
+		r.dbg.pipes += time.Since(b0)
 	}
 	return s, nil
 }
@@ -1385,6 +1419,10 @@ func (r *Renderer) batchPipe(b gpu.Batch) id {
 // unless part is nil, in its rectangles: what target holds elsewhere is
 // kept.
 func (r *Renderer) drawBuilt(cb id, s *scene.Scene, target id, d *drawState, part *gpu.Part) error {
+	if r.dbg != nil {
+		t0 := time.Now()
+		defer func() { r.dbg.encode += time.Since(t0) }()
+	}
 	instBuf := d.instBufs[r.inUse]
 	load := uintptr(loadActionClear)
 	if part != nil {
@@ -1778,7 +1816,16 @@ func (r *Renderer) Render(s *scene.Scene) (err error) {
 	if s.Width <= 0 || s.Height <= 0 || r.layer == 0 {
 		return nil
 	}
-	pool(func() { err = r.render(s) })
+	pool(func() {
+		if r.dbg == nil {
+			err = r.render(s)
+			return
+		}
+		r.dbg.reset()
+		t0 := time.Now()
+		err = r.render(s)
+		r.dbg.total = time.Since(t0)
+	})
 	return err
 }
 
@@ -1846,10 +1893,22 @@ func (r *Renderer) render(s *scene.Scene) error {
 	if !sync && r.fetched != nil && !r.pre.ready(r.fetched) {
 		// The next drawable is being fetched: the frame is built now and
 		// drawn into it once the presenter has it.
+		if r.dbg != nil {
+			r.dbg.stashed = true
+		}
 		return r.stash(s, damage, known)
 	}
 	var drawable id
+	var dbgT time.Time
+	if r.dbg != nil {
+		dbgT = time.Now()
+		r.dbg.sync = sync
+	}
 	cb, err := r.drawFrame(s, damage, known, func() id {
+		if r.dbg != nil {
+			a0 := time.Now()
+			defer func() { r.dbg.acquire += time.Since(a0) }()
+		}
 		if sync != r.synced {
 			on := uintptr(0)
 			if sync {
@@ -1860,15 +1919,24 @@ func (r *Renderer) render(s *scene.Scene) error {
 		}
 		if !sync {
 			drawable = r.prefetched()
+			if r.dbg != nil && drawable != 0 {
+				r.dbg.src = "prefetch"
+			}
 		}
 		if drawable == 0 {
 			drawable = send(r.layer, "nextDrawable")
+			if r.dbg != nil {
+				r.dbg.src = "fresh"
+			}
 		}
 		if drawable == 0 {
 			return 0
 		}
 		return send(drawable, "texture")
 	})
+	if r.dbg != nil {
+		r.dbg.draw = time.Since(dbgT)
+	}
 	if err != nil {
 		return err
 	}
@@ -1879,6 +1947,9 @@ func (r *Renderer) render(s *scene.Scene) error {
 		r.track(cb)
 		return nil
 	}
+	if r.dbg != nil {
+		dbgT = time.Now()
+	}
 	if sync {
 		send(cb, "commit")
 		send(cb, "waitUntilScheduled")
@@ -1888,6 +1959,9 @@ func (r *Renderer) render(s *scene.Scene) error {
 		send(cb, "commit")
 		// The next frame's drawable, while this one is shown.
 		r.pre.start(r.layer)
+	}
+	if r.dbg != nil {
+		r.dbg.commit = time.Since(dbgT)
 	}
 	r.track(cb)
 	r.lastRender = time.Now()
@@ -2191,6 +2265,9 @@ func (r *Renderer) Release() {
 // FrameInfo describes the last frame for MYGO_FRAME_STATS.
 func (r *Renderer) FrameInfo() string {
 	info := r.b.Summary()
+	if r.dbg != nil {
+		info += "; " + r.dbg.String()
+	}
 	switch r.redrew {
 	case redrewPart:
 		info = fmt.Sprintf("redrew %s, %s", r.part.String(), info)

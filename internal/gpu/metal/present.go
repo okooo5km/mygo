@@ -224,9 +224,22 @@ func (r *Renderer) finishPending(prefetch bool) error {
 	p := r.pending
 	r.pending = pendingFrame{}
 	defer r.wakeContent()
+	var a0 time.Time
+	if r.dbg != nil {
+		a0 = time.Now()
+	}
 	drawable := r.prefetched()
+	if r.dbg != nil {
+		r.dbg.src = "pending-prefetch"
+	}
 	if drawable == 0 {
 		drawable = send(r.layer, "nextDrawable")
+		if r.dbg != nil {
+			r.dbg.src = "pending-fresh"
+		}
+	}
+	if r.dbg != nil {
+		r.dbg.acquire += time.Since(a0)
 	}
 	if drawable == 0 {
 		// None came within a second: the frame is skipped, what it drew
