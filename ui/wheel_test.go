@@ -373,3 +373,57 @@ func TestWheelSpringBounds(t *testing.T) {
 		t.Errorf("at %v, want 0", s.Y)
 	}
 }
+
+// A wheel an app turns into a ScrollTo of its own, a notch at a time,
+// glides on WheelAnimation as steadily as the engine's own notches: the
+// glide keeps its velocity when the next notch retargets it.
+func TestScrollToWheelAnimationSteadySpeed(t *testing.T) {
+	for _, frame := range []time.Duration{16667 * time.Microsecond, 8333 * time.Microsecond} {
+		const every, notch = 50 * time.Millisecond, 40.0
+		var s ScrollState
+		tt := coreNewTester(func(c *context) {
+			coreScroll(c).Fill().TrackScroll(&s).Children(func() {
+				coreBox(c).Height(100000).Shrink(0)
+			})
+		}, 200, 200)
+		tt.h.hz = float32(float64(time.Second) / float64(frame))
+		tt.Move(100, 100)
+		tt.Frame()
+		var deltas []float64
+		last, to := float64(s.Y), 0.0
+		next := time.Duration(0)
+		for at := time.Duration(0); at < 2*time.Second; at += frame {
+			if at >= next && at < time.Second {
+				to += notch
+				s.ScrollTo(0, float32(to), WheelAnimation)
+				tt.Frame() // an app's event rebuilds the frame
+				next += every
+			}
+			tt.Advance(frame)
+			deltas = append(deltas, float64(s.Y)-last)
+			last = float64(s.Y)
+		}
+		lo, hi := int(400*time.Millisecond/frame), int(time.Second/frame)
+		w := deltas[lo:hi]
+		var sum, sq float64
+		for _, v := range w {
+			sum += v
+			sq += v * v
+		}
+		mean := sum / float64(len(w))
+		sd := math.Sqrt(max(0, sq/float64(len(w))-mean*mean))
+		want := notch * float64(frame) / float64(every)
+		t.Logf("frames of %v: mean %.2f, sd %.2f px a frame", frame, mean, sd)
+		if math.Abs(mean-want) > want*0.15 {
+			t.Errorf("frames of %v: %.2f px a frame, want about %.2f", frame, mean, want)
+		}
+		// The engine's wheel has sd 0.67 (60 Hz) and 0.43 (120 Hz); a
+		// spring of 0.115 s has 1.46 at 120 Hz.
+		if sd > 0.1*mean {
+			t.Errorf("frames of %v: sd %.2f px a frame, want <= %.2f", frame, sd, 0.1*mean)
+		}
+		if s.Y != float32(to) {
+			t.Errorf("frames of %v: rests at %v, want %v", frame, s.Y, to)
+		}
+	}
+}

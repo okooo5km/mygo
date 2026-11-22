@@ -14,18 +14,28 @@ const wheelRate = 28
 // wheelPrecision is how close, in DIPs, a notch's glide rests at its end.
 const wheelPrecision = 0.1
 
-// wheelAnimation is how the notches of a mouse wheel scroll: on a
+// WheelAnimation is how the notches of a mouse wheel scroll: on a
 // critically damped spring, which does not overshoot and, retargeted by
 // the next notch, keeps its velocity, so that a wheel turning steadily
 // scrolls steadily. A curve restarted at every notch, as it was, starts
 // over at its fastest, and the content went by 10, 17 and 13 px a frame
 // in turn at 50 ms between notches.
-var wheelAnimation = Animation{Spring: SpringOptions{
+//
+// An app that turns a wheel into a ScrollTo of its own, as a horizontal
+// strip does with a vertical wheel, glides it with this, to go as the
+// engine's own notches do: ScrollTo keeps the velocity on the way too.
+// A spring of SwiftUI's kind of about 0.1 s, at the same 40 DIPs every
+// 50 ms, makes the content go by 4.3 to 8.5 px a frame at 120 Hz where
+// this goes by 6.0 to 7.2.
+var WheelAnimation = Animation{Spring: SpringOptions{
 	Mass:      1,
 	Stiffness: wheelRate * wheelRate,
 	Damping:   2 * wheelRate,
 	Precision: wheelPrecision,
 }}
+
+// wheelAnimation is how the engine's own notches scroll.
+var wheelAnimation = WheelAnimation
 
 // wheelGlide is the notches of a wheel on their way through a scroll
 // container: x and y go from 0 to as far as all of them scroll, and done
