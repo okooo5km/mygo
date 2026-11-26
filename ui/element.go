@@ -529,6 +529,7 @@ type node struct {
 	// the text it takes is (TextCaret).
 	inputFn    func(InputEvent) bool
 	observeFn  func(InputEvent) // the input in it (ObserveInput)
+	intentText bool             // ObserveText(true)
 	textClient TextInputClient
 	caret      Rect
 	takesText  bool

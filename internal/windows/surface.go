@@ -133,9 +133,15 @@ type surface struct {
 	clicks   platform.ClickCounter
 	cursor   platform.Cursor
 	high     uint16 // a high surrogate of WM_CHAR waiting for its pair
-	ime      bool
-	caret    platform.RectF
-	input    platform.TextInputState
+	// ime tells that the window has an input context: a text input is active
+	// (imeActive) or an element that opens one from typed text has the focus
+	// (intent, surface_intent.go). lastCaret is where the last text input's
+	// caret was, where the input method's windows wait in the second case.
+	ime, imeActive bool
+	caret          platform.RectF
+	lastCaret      platform.RectF
+	input          platform.TextInputState
+	intent         imeIntent
 
 	// pointerAt is where on the screen the last WM_POINTER message's
 	// pointer was, in pixels (pointerMessage).
@@ -638,8 +644,12 @@ func cursorHandle(c platform.Cursor) uintptr {
 
 func (s *surface) SetTextInput(t platform.TextInputState) {
 	// Without input methods, the window has no input context: keys type
-	// the layout's characters, as WM_CHAR, as winit's do.
+	// the layout's characters, as WM_CHAR, as winit's do. The exception is
+	// an element that opens a text input from typed text having the focus
+	// (t.Intent): the context stays, so that the key that opens the input
+	// reaches the input method (surface_intent.go).
 	active, caret := t.Active && !t.NoInputMethod, t.Caret
+	ready := t.Intent && !t.Active
 	if s.input.Active && s.input.Client != t.Client {
 		s.clientComposition.Reset()
 		if himc, _, _ := procImmGetContext.Call(s.hwnd); himc != 0 {
@@ -649,21 +659,39 @@ func (s *surface) SetTextInput(t platform.TextInputState) {
 		s.reconvert = nil
 	}
 	s.input = t
-	if active != s.ime {
-		s.ime = active
-		if active {
+	wasActive := s.imeActive
+	s.imeActive = active
+	if want := active || ready; want != s.ime {
+		s.ime = want
+		if want {
 			procImmAssociateContextEx.Call(s.hwnd, 0, iaceDefault)
 		} else {
 			s.reconvert = nil
+			s.intent.Drop() // what the completion makes is ignored
 			if himc, _, _ := procImmGetContext.Call(s.hwnd); himc != 0 {
 				procImmNotifyIME.Call(himc, niCompositionStr, cpsComplete, 0)
 				procImmReleaseContext.Call(s.hwnd, himc)
 			}
 			procImmAssociateContextEx.Call(s.hwnd, 0, 0)
+			// Nothing more comes for this context, not even WM_IME_ENDCOMPOSITION: start over.
+			procKillTimer.Call(s.hwnd, timerIntent)
+			s.intent.Reset()
 		}
+	} else if wasActive && !active && ready {
+		// The text input let go of the keyboard to the element that opens it: its composition
+		// goes nowhere, and what it makes until it ends is dropped.
+		s.reconvert = nil
+		s.dropIntent()
 	}
 	s.caret = caret
 	if active {
+		s.lastCaret = caret
+		s.placeIME()
+		if s.intent.Pending() {
+			postMessage(s.hwnd, wmAppIntent, 0, 0)
+		}
+	} else if ready && s.lastCaret != (platform.RectF{}) {
+		s.caret = s.lastCaret
 		s.placeIME()
 	}
 }
@@ -688,6 +716,9 @@ func (s *surface) placeIME() {
 func (s *surface) send(ev platform.SurfaceEvent) bool {
 	if ev.Kind == platform.PointerDown || ev.Kind == platform.SurfaceBlur {
 		s.clientComposition.Reset()
+		if s.intent.Pending() {
+			s.dropIntent()
+		}
 	}
 	if !s.held.Track(ev) {
 		return false
@@ -771,6 +802,10 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 	case wmTimer:
 		if wp == timerUncloak {
 			s.uncloak()
+			return 0, true
+		}
+		if wp == timerIntent {
+			s.dropIntent() // no text input became active for the composition the content claimed
 			return 0, true
 		}
 		if wp == timerWebView {
@@ -983,6 +1018,7 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 	case wmKeyDown, wmSysKeyDown:
 		s.clientComposition.Reset()
 		s.keyTaken, s.menuRan = false, false
+		s.intent.NewKey()
 		modifiers := mods()
 		if modifierKey(wp) {
 			s.send(platform.SurfaceEvent{Kind: platform.ModifiersChanged, Mods: modifiers})
@@ -992,7 +1028,12 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 		}
 		rawTaken := false
 		k, physical, ok := keyAndPosition(wp, lp, false, modifiers)
-		if ok {
+		if s.commandThroughIME(wp, lp) {
+			// The input method took a key the content acts on (a digit in kana mode, a full-width
+			// Space): the content gets it by position, as without an input context.
+			rawTaken = s.commandKey(lp, modifiers)
+			s.keyTaken = rawTaken
+		} else if ok {
 			s.keyTaken = s.send(platform.SurfaceEvent{Kind: platform.KeyPressed, Key: k, PhysicalKey: physical, Code: keyCode(wp, lp), Mods: modifiers, Repeat: lp&(1<<30) != 0})
 		} else {
 			rawTaken = s.rawKey(platform.RawKeyPressed, wp, lp, physical, modifiers)
@@ -1059,12 +1100,20 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(m), wp, lp&^iscShowUICompWindow)
 		return r, true
 	case wmImeStartComp:
+		s.intent.Start()
 		s.placeIME()
 		return 0, true
 	case wmImeComposition:
 		himc, _, _ := procImmGetContext.Call(hwnd)
 		if himc == 0 {
 			return 0, true
+		}
+		if s.ime && !s.imeActive || s.intent.Pending() || s.intent.command {
+			// no text input is active (or a claimed composition waits for one): see intentComposed
+			if s.intentComposed(intentRead(himc, lp)) {
+				procImmReleaseContext.Call(hwnd, himc)
+				return 0, true
+			}
 		}
 		if lp&gcsResultStr != 0 {
 			if text := imeString(himc, gcsResultStr); text != "" {
@@ -1092,6 +1141,9 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 		s.placeIME()
 		return 0, true
 	case wmImeEndComp:
+		if s.intentEnded() {
+			return 0, true
+		}
 		s.reconvert = nil
 		if c := s.input.Client; c != nil {
 			s.clientComposition.End(c)
@@ -1100,6 +1152,9 @@ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool
 		s.send(platform.SurfaceEvent{Kind: platform.TextComposition})
 		return 0, true
 	case wmImeChar:
+		return 0, true
+	case wmAppIntent:
+		s.intentMessage(wp)
 		return 0, true
 	case wmImeRequest:
 		return s.imeRequest(wp, lp), true

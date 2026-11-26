@@ -189,6 +189,19 @@ func (e *node) ObserveInput(fn func(ev InputEvent)) *node {
 	return e
 }
 
+// ObserveText tells that the observer of the element (ObserveInput) opens a
+// text input from the text typed while the focus is in it, as a panel's
+// type-to-search does. While on, and no text input has the keyboard, the
+// host is told (platform.TextInputState.Intent) so that a platform whose
+// input methods only compose in a window with an input context (Windows)
+// keeps one for it: the first key then reaches the input method, which
+// composes it, and the observer claims it (InputEvent.Claim) as it does a
+// macOS intent. Off, as by default, keys type the layout's characters.
+func (e *node) ObserveText(on bool) *node {
+	e.intentText = on
+	return e
+}
+
 // TextCaret has the element take text from the system's input methods
 // while it has the keyboard focus, with their composition at r, the caret,
 // relative to the element's box: candidate windows show there. Its

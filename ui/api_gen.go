@@ -1745,7 +1745,9 @@ func Local[T any](e Element, key any, init func() T) *T {
 // Right opens a submenu and Left closes it, the other way round right to
 // left (Direction); Enter and Space choose an item, Escape closes the
 // submenu on top, and Tab and a press outside the menu close it. The
-// pointer highlights the item it moves onto, opening its submenu.
+// pointer highlights the item it moves onto, opening its submenu, but for
+// those it crosses heading for a submenu that shows, which stays open
+// until the pointer rests on one of them (menuAimGrace).
 // Assistive technology sees a menu button, expanded while its menu shows,
 // and a menu of items, check box items and radio items. PopoverMenuButton
 // draws its menu with these parts, in the theme's look.
@@ -6690,6 +6692,24 @@ func (_handle Element) ObserveInput(fn func(ev InputEvent)) Element {
 	_ctx := _node.c
 	_ = _ctx
 	return wrapElement(_node.ObserveInput(fn))
+}
+
+// ObserveText tells that the observer of the element (ObserveInput) opens a
+// text input from the text typed while the focus is in it, as a panel's
+// type-to-search does. While on, and no text input has the keyboard, the
+// host is told (platform.TextInputState.Intent) so that a platform whose
+// input methods only compose in a window with an input context (Windows)
+// keeps one for it: the first key then reaches the input method, which
+// composes it, and the observer claims it (InputEvent.Claim) as it does a
+// macOS intent. Off, as by default, keys type the layout's characters.
+func (_handle Element) ObserveText(on bool) Element {
+	_node := _handle.node()
+	if _node == nil {
+		return Element{}
+	}
+	_ctx := _node.c
+	_ = _ctx
+	return wrapElement(_node.ObserveText(on))
 }
 
 // OnPaste has fn see a paste into a text input, by Cmd+V, Ctrl+V or a

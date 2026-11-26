@@ -1713,6 +1713,7 @@ func (rt *engine) commitElement(e *node, clip Rect, hidden bool) {
 	if s.observe = e.observeFn; s.observe != nil {
 		rt.observers++
 	}
+	s.intentText = e.intentText && s.observe != nil
 	s.copyData = e.copyData
 	if s.textClient != e.textClient {
 		if s.textAdapter != nil {

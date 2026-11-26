@@ -1585,6 +1585,17 @@ func (rt *engine) updateTextInput() {
 		r := transformRect(s.world, Rect{s.x + s.caret.X, s.y + s.caret.Y, s.caret.W, s.caret.H})
 		t.Caret = rt.toWindow(platform.RectF{X: float64(r.X), Y: float64(r.Y), W: float64(r.W), H: float64(r.H)})
 	}
+	if !t.Active && rt.windowFocused {
+		for s := rt.states[rt.focused]; s != nil; s = rt.states[s.parent] {
+			if s.intentText && s.flags&flagDisabled == 0 {
+				t.Intent = true
+				break
+			}
+			if s.parent == 0 {
+				break
+			}
+		}
+	}
 	if t.Active {
 		if s := rt.states[rt.focused]; s != nil {
 			t.Traits = s.traits

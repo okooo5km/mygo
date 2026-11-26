@@ -287,6 +287,11 @@ type FirstFrameSurface interface {
 type TextInputState struct {
 	// Active is true while an editable element has the keyboard.
 	Active bool
+	// Intent is true while no text input has the keyboard but an element
+	// that opens one from typed text has the focus (ui ObserveText): a
+	// surface whose input methods need an input context (Windows) keeps
+	// one, so that the key that opens the input reaches them.
+	Intent bool
 	// Caret is the caret's rectangle, in DIPs relative to the surface.
 	Caret RectF
 	// Text is the input's text around the caret, and Start and End are the

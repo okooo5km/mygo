@@ -1164,6 +1164,12 @@ func (t *Tester) TextInputActive() (active, noInputMethod bool) {
 	return t.h.ime.Active, t.h.ime.NoInputMethod
 }
 
+// TextInputIntent reports whether the window tells the system that an
+// element that opens a text input from typed text has the focus and none
+// is active (ObserveText), as a platform whose input methods need an input
+// context (Windows) keeps one then.
+func (t *Tester) TextInputIntent() bool { return t.h.ime.Intent && !t.h.ime.Active }
+
 // Clipboard returns the text the view copied; SetClipboard sets the text
 // it pastes.
 func (t *Tester) Clipboard() string { return t.h.clipboard }

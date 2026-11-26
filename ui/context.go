@@ -960,6 +960,7 @@ type state struct {
 	// (HandleInput, TextCaret).
 	input       func(InputEvent) bool
 	observe     func(InputEvent) // ObserveInput
+	intentText  bool             // ObserveText: the observer opens a text input from typed text
 	textClient  TextInputClient
 	textAdapter *textInputAdapter
 	caret       Rect
