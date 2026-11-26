@@ -161,6 +161,12 @@ func (rt *engine) event(ev platform.SurfaceEvent) (taken bool) {
 			rt.deliver(h, InputEvent{Kind: InputKeyUp, Key: key, PhysicalKey: physical, Code: KeyCode(ev.Code), Mods: Modifiers(ev.Mods)})
 		}
 	case platform.TextInput:
+		if ev.Intent {
+			claimed := false
+			rt.observeFocus(InputEvent{Kind: InputText, Text: ev.Text, Mods: Modifiers(ev.Mods), Intent: true, Claim: func() { claimed = true }})
+			taken = claimed
+			break
+		}
 		rt.editEvent(rt.replaced(editEvent{kind: editInsert, text: ev.Text}, ev))
 	case platform.TextComposition:
 		taken = rt.editEvent(rt.replaced(editEvent{kind: editCompose, text: ev.Text, caret: ev.Caret}, ev))
@@ -1896,6 +1902,10 @@ func (e *node) Focus(options ...FocusOptions) *node {
 		o = options[0]
 	}
 	e.focus(!o.PreventScroll)
+	if o.CaretToEnd && e.hasState() && e.st.editor != nil {
+		ed := e.st.editor
+		ed.editorSelection = editorSelection{caret: ed.buf.n, anchor: ed.buf.n}
+	}
 	return e
 }
 
@@ -1906,6 +1916,10 @@ type FocusOptions struct {
 	// are when the focus moves to it, as the web's preventScroll does,
 	// rather than scrolling them as little as shows it.
 	PreventScroll bool
+	// CaretToEnd puts the caret of a text input at the end of its text,
+	// nothing selected, as the focus of a field that is typed into at
+	// once (Focus alone keeps the caret where it was).
+	CaretToEnd bool
 }
 
 // focus gives the element the keyboard focus, as Focus does, and scrolls

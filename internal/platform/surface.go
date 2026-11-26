@@ -628,6 +628,12 @@ type SurfaceEvent struct {
 	// selection.
 	Replace  bool
 	From, To int
+	// Intent makes a TextInput the layout characters of a key that no text
+	// input has the focus for (macOS): they are shown to the elements that
+	// observe their input and inserted nowhere, and the surface hands the
+	// key to the input method once a text input has the focus. The result
+	// of the event tells whether an observer claimed it (InputEvent.Claim).
+	Intent bool
 	// Files are the paths of FileDrop's files, or original native paths
 	// for DataDrop's legacy file-listener fallback.
 	Files []string

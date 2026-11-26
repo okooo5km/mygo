@@ -11,6 +11,7 @@ import (
 	"structs"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf16"
 	"unsafe"
 
@@ -178,6 +179,9 @@ type surface struct {
 	// refused: the content left the composition set in
 	// interpretKeyEvents, given up once it returns.
 	refused bool
+	// pending are keys typed with no text input focused that an element
+	// asked to be typed into one it gives the focus (Intent).
+	pending keyQueue
 
 	// Accessibility: whether the content describes its frames, the last
 	// tree, the elements of its nodes and those at the top (an NSArray).
@@ -248,13 +252,17 @@ func (b *Backend) watchCommandKeyUps() {
 		if s == nil {
 			return ev
 		}
-		s.send(platform.SurfaceEvent{Kind: platform.KeyReleased, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: mods})
+		up := platform.SurfaceEvent{Kind: platform.KeyReleased, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: mods}
+		if !s.pending.holdUp(keyCodeOf(ev), up) {
+			s.send(up)
+		}
 		return 0
 	})
 	commandKeyUps = retain(send(class("NSEvent"), "addLocalMonitorForEventsMatchingMask:handler:", mask, uintptr(blk)))
 }
 
 func (s *surface) destroy() {
+	s.dropPending()
 	s.CancelDataDrag()
 	if s.link != 0 {
 		send(s.link, "invalidate")
@@ -558,6 +566,9 @@ func (s *surface) frameNow(paced bool) {
 	armPass()
 	s.lastFrame = time.Now()
 	s.deferred = s.send(platform.SurfaceEvent{Kind: platform.SurfaceFrame, Paced: paced}) && paced
+	if !s.input.Active && s.pending.frame() {
+		s.dropPending()
+	}
 }
 
 // presentsWithTransaction reports whether the GPU renderer's CAMetalLayer
@@ -808,6 +819,15 @@ func (s *surface) SetTextInput(t platform.TextInputState) {
 	}
 	moved := t.Active != s.input.Active || t.Caret != s.input.Caret
 	s.input = t
+	if t.Active && len(s.pending.keys) > 0 {
+		// Not inside the frame that gave the input the focus: the input
+		// method answers by sending text to the content.
+		theBackend.post(func() {
+			if s.input.Active {
+				s.replayPending()
+			}
+		})
+	}
 	if t.Active && moved {
 		send(send(s.view, "inputContext"), "invalidateCharacterCoordinates")
 	}
@@ -821,6 +841,9 @@ func (w *window) surfaceKeyChanged(key bool) {
 	s := w.surface
 	if s == nil || send(w.win, "firstResponder") != s.view {
 		return
+	}
+	if !key {
+		s.dropPending()
 	}
 	kind := platform.SurfaceBlur
 	if key {
@@ -1121,6 +1144,9 @@ func registerSurfaceClass() {
 			if s == nil {
 				return
 			}
+			if kind == platform.PointerDown {
+				s.dropPending()
+			}
 			btn := button
 			switch {
 			case button == 2:
@@ -1298,6 +1324,7 @@ func registerSurfaceClass() {
 		}),
 		method("resignFirstResponder", func(self id, _ objc.SEL) bool {
 			if s := b().surfaceOf(self); s != nil {
+				s.dropPending()
 				s.send(platform.SurfaceEvent{Kind: platform.SurfaceBlur})
 			}
 			return true
@@ -1372,51 +1399,26 @@ func registerSurfaceClass() {
 			if s == nil {
 				return
 			}
-			mods := eventMods(ev)
-			text := s.input.Active && mods&(platform.ModSuper|platform.ModCtrl) == 0
-			ime := text && !s.input.NoInputMethod
-			// A key typed while the input method composes is the input
-			// method's, as Enter choosing a candidate or Escape giving the
-			// composition up, as GTK's and IMM32's filtering keeps them on
-			// Linux and Windows, unless the input method passes it on
-			// (doCommandBySelector:).
-			key := platform.SurfaceEvent{Kind: platform.KeyPressed, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: mods, Repeat: sendBool(ev, "isARepeat")}
-			withheld := ime && s.hasMarkedText()
-			if !withheld {
-				s.send(key)
+			switch {
+			case s.input.Active:
+				// Keys held for a text input that has the focus now go to
+				// it first, in the order they came.
+				s.replayPending()
+			case len(s.pending.keys) > 0:
+				// Behind the keys held for the input that is about to have
+				// the focus, whatever the key: Space after "ni" chooses the
+				// candidate, it does not preview a clip before the text.
+				s.pending.add(retain(ev), pendingKey{code: keyCodeOf(ev)})
+				return
 			}
-			// Input methods see the key while a text input has the focus;
-			// they answer with insertText: or setMarkedText:.
-			// A held key's repeats type it again where there is no text
-			// for press and hold's accents to replace, as a terminal's
-			// input, which takes text itself (no Client): the accents
-			// menu, holding the repeats back, would type nothing there.
-			if ime && s.input.Client == nil && sendBool(ev, "isARepeat") && !s.hasMarkedText() {
-				if t := typedChars(stringOf(send(ev, "characters"))); t != "" {
-					s.insertText(t, nsRange{Location: nsNotFound})
-				}
-			} else if ime {
-				s.keyDown = true
-				if withheld {
-					s.withheld = &key
-				}
-				interpretKeys(self, ev)
-				s.keyDown, s.withheld = false, nil
-				if s.refused {
-					s.refused = false
-					s.discardComposition()
-				}
-			} else if text {
-				// Input methods off: the key types the characters of the
-				// layout, as winit's keys do without them.
-				if t := typedChars(stringOf(send(ev, "characters"))); t != "" {
-					s.insertText(t, nsRange{Location: nsNotFound})
-				}
-			}
+			s.keyDownNow(ev, true)
 		}),
 		method("keyUp:", func(self id, _ objc.SEL, ev id) {
 			if s := b().surfaceOf(self); s != nil {
-				s.send(platform.SurfaceEvent{Kind: platform.KeyReleased, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: eventMods(ev)})
+				up := platform.SurfaceEvent{Kind: platform.KeyReleased, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: eventMods(ev)}
+				if !s.pending.holdUp(keyCodeOf(ev), up) {
+					s.send(up)
+				}
 			}
 		}),
 		method("flagsChanged:", func(self id, _ objc.SEL, ev id) {
@@ -1540,4 +1542,194 @@ func registerSurfaceClass() {
 func (s *surface) dragPoint(info id) (float64, float64) {
 	p := msgPointFromView(s.view, sel("convertPoint:fromView:"), msgPoint(info, sel("draggingLocation")), 0)
 	return p.X, p.Y
+}
+
+// keyDownNow handles a key pressed (or replayed): sendKey is false for a
+// key the content already got the press of (the one an intent was sent for).
+func (s *surface) keyDownNow(ev id, sendKey bool) {
+	mods := eventMods(ev)
+	text := s.input.Active && mods&(platform.ModSuper|platform.ModCtrl) == 0
+	ime := text && !s.input.NoInputMethod
+	// A key typed while the input method composes is the input
+	// method's, as Enter choosing a candidate or Escape giving the
+	// composition up, as GTK's and IMM32's filtering keeps them on
+	// Linux and Windows, unless the input method passes it on
+	// (doCommandBySelector:).
+	key := platform.SurfaceEvent{Kind: platform.KeyPressed, Key: eventKey(ev), PhysicalKey: physicalKey(ev), Code: eventKeyCode(ev), Mods: mods, Repeat: sendBool(ev, "isARepeat")}
+	withheld := ime && s.hasMarkedText()
+	if !withheld && sendKey {
+		s.send(key)
+	}
+	// Input methods see the key while a text input has the focus;
+	// they answer with insertText: or setMarkedText:.
+	// A held key's repeats type it again where there is no text
+	// for press and hold's accents to replace, as a terminal's
+	// input, which takes text itself (no Client): the accents
+	// menu, holding the repeats back, would type nothing there.
+	if ime && s.input.Client == nil && sendBool(ev, "isARepeat") && !s.hasMarkedText() {
+		if t := typedChars(stringOf(send(ev, "characters"))); t != "" {
+			s.insertText(t, nsRange{Location: nsNotFound})
+		}
+	} else if ime {
+		s.keyDown = true
+		if withheld {
+			s.withheld = &key
+		}
+		interpretKeys(s.view, ev)
+		s.keyDown, s.withheld = false, nil
+		if s.refused {
+			s.refused = false
+			s.discardComposition()
+		}
+	} else if text {
+		// Input methods off: the key types the characters of the
+		// layout, as winit's keys do without them.
+		if t := typedChars(stringOf(send(ev, "characters"))); t != "" {
+			s.insertText(t, nsRange{Location: nsNotFound})
+		}
+	} else if !s.input.Active && sendKey {
+		// No text input has the focus: an element that observes the input
+		// (type-to-search) may give one the focus for this key. It is told
+		// the key types text (an intent, nothing inserted) and, if it
+		// claims it, the key is held to go through the input method once
+		// the input has the focus, as if it had had it.
+		t := intentText(stringOf(send(ev, "characters")), stringOf(send(ev, "charactersIgnoringModifiers")), mods)
+		if t != "" && s.send(platform.SurfaceEvent{Kind: platform.TextInput, Text: t, Mods: mods, Intent: true}) {
+			s.holdFirstKey(ev)
+		}
+	}
+}
+
+// Keys held for a text input about to have the focus: dropped after this
+// many frames drawn with no input active. The key's frame builds the box and
+// gives it the focus in the same pass (the input is active when that frame
+// ends); a second frame lays out what the first opened, and the others are
+// slack for a slow one. A frame the content has not drawn counts for nothing,
+// so a stall (decoding, GC) does not use them up; pendingBackstop only keeps
+// a key from being held for ever if frames stop altogether.
+const (
+	maxPendingFrames = 10
+	pendingBackstop  = 2 * time.Second
+)
+
+// pendingKey is a key held in a keyQueue: its retained NSEvent, its key code,
+// whether the content got its press already (the key an intent was sent for)
+// and, for a key held with its press, the release that came meanwhile.
+type pendingKey struct {
+	ev   id
+	code uint16
+	sent bool
+	up   *platform.SurfaceEvent
+}
+
+// keyQueue holds keys in the order they came; every key is released on every
+// path (replay, drop, expiry).
+type keyQueue struct {
+	keys   []pendingKey
+	frames int    // frames drawn since the first was held
+	gen    uint64 // which run of held keys this is, for the backstop timer
+}
+
+func (q *keyQueue) add(ev id, k pendingKey) {
+	if len(q.keys) == 0 {
+		q.frames = 0
+		q.gen++
+	}
+	k.ev = ev
+	q.keys = append(q.keys, k)
+}
+
+// holdUp keeps the release of a key whose press the content has not got, to
+// come after it; false for any other, which goes on at once.
+func (q *keyQueue) holdUp(code uint16, up platform.SurfaceEvent) bool {
+	for i := len(q.keys) - 1; i >= 0; i-- {
+		if k := &q.keys[i]; !k.sent && k.code == code && k.up == nil {
+			k.up = &up
+			return true
+		}
+	}
+	return false
+}
+
+// frame counts a frame drawn while no input is active, and reports whether
+// the keys have waited for too many.
+func (q *keyQueue) frame() bool {
+	if len(q.keys) == 0 {
+		return false
+	}
+	q.frames++
+	return q.frames > maxPendingFrames
+}
+
+// take empties the queue.
+func (q *keyQueue) take() []pendingKey {
+	k := q.keys
+	q.keys = nil
+	return k
+}
+
+// releaseAll releases the events of keys.
+func releaseAll(keys []pendingKey, release func(id)) {
+	for _, k := range keys {
+		release(k.ev)
+	}
+}
+
+func keyCodeOf(ev id) uint16 { return uint16(sendInt(ev, "keyCode")) }
+
+// intentText is the text a key types where no input method is involved yet:
+// its characters of the layout, or with Option those of the key itself
+// (a dead key has none of its own), none for a space, without the control
+// characters of Return, Tab, Escape and Delete nor the private-use ones of
+// the arrows and function keys. Command and Control type nothing.
+func intentText(chars, ignoring string, mods platform.Modifiers) string {
+	if mods&(platform.ModSuper|platform.ModCtrl) != 0 {
+		return ""
+	}
+	t := typedChars(chars)
+	if t == "" && mods&platform.ModAlt != 0 {
+		t = typedChars(ignoring)
+	}
+	for _, r := range t {
+		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return "" // a space or a control key types nothing to search for
+		}
+	}
+	return t
+}
+
+// holdFirstKey holds the key an intent was claimed for (the content got its
+// press), and starts the backstop.
+func (s *surface) holdFirstKey(ev id) {
+	s.pending.add(retain(ev), pendingKey{code: keyCodeOf(ev), sent: true})
+	gen := s.pending.gen
+	time.AfterFunc(pendingBackstop, func() {
+		theBackend.post(func() {
+			if s.pending.gen == gen && len(s.pending.keys) > 0 {
+				s.dropPending()
+			}
+		})
+	})
+}
+
+// dropPending releases every held key without typing it: another click, the
+// loss of the keyboard, a closed window, frames that gave no text input, or
+// the backstop say the text is not coming. A key held with its press never
+// reached the content, nor does its release: the content sees neither.
+func (s *surface) dropPending() {
+	releaseAll(s.pending.take(), release)
+}
+
+// replayPending hands the held keys, all of them whatever their age, to the
+// text input that has the focus, in order, as keyDown: does for keys typed
+// with it focused: the press of a key the content did not get, then the
+// input method's answer (insertText: or setMarkedText:), then its release.
+func (s *surface) replayPending() {
+	for _, k := range s.pending.take() {
+		s.keyDownNow(k.ev, !k.sent)
+		if k.up != nil {
+			s.send(*k.up)
+		}
+		release(k.ev)
+	}
 }

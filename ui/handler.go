@@ -89,6 +89,18 @@ type InputEvent struct {
 	// rune of an InputCompose's caret.
 	Text  string
 	Caret int
+	// Intent marks an InputText that is only seen, by ObserveInput, never
+	// inserted: the layout characters of a key typed on macOS while no text
+	// input has the focus. An observer that gives a text input the focus
+	// (type-to-search) must not add Text itself: the system's input method
+	// gets the same key once the input has the focus, so that it composes
+	// (pinyin) and types dead keys as with the input focused. Elements with
+	// HandleInput and the menus do not see it; Windows never sends it.
+	// The observer that acts on it calls Claim, during the call of its
+	// function: only then does the system keep the key for the input method
+	// (a key nobody claims is typed nowhere).
+	Intent bool
+	Claim  func()
 	// X and Y locate the pointer relative to the element's box.
 	X, Y float32
 	// Button is 0 for the primary button, 1 the secondary and 2 the
@@ -247,12 +259,12 @@ func (rt *engine) deliver(s *state, ev InputEvent) bool {
 
 // observeFocus shows ev to the elements around the focus that observe
 // their input (ObserveInput).
-func (rt *engine) observeFocus(ev InputEvent) {
+func (rt *engine) observeFocus(ev InputEvent) bool {
 	if rt.observers == 0 || rt.focused == 0 || !rt.windowFocus() {
-		return
+		return false
 	}
 	chain := rt.appendFocusChain(rt.observeBuf[:0])
-	rt.observe(chain, ev)
+	return rt.observe(chain, ev)
 }
 
 // observePointer shows ev to the elements under the pointer that observe
@@ -270,7 +282,7 @@ func (rt *engine) observePointer(ev InputEvent) {
 // first, as UI Events capture, with the pointer's position relative to
 // each one's box. chain is rt.observeBuf's, which it holds meanwhile, as
 // fn may run a nested main loop that brings another event.
-func (rt *engine) observe(chain []uint64, ev InputEvent) {
+func (rt *engine) observe(chain []uint64, ev InputEvent) bool {
 	rt.observeBuf = nil
 	defer func() { rt.observeBuf = chain[:0] }()
 	ev.Time = rt.now()
@@ -287,6 +299,7 @@ func (rt *engine) observe(chain []uint64, ev InputEvent) {
 	if seen {
 		rt.requestFrame()
 	}
+	return seen
 }
 
 // focusHandler returns the state of the focused element when it handles

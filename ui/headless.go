@@ -1104,6 +1104,15 @@ func (t *Tester) TypeKey(mods Modifiers, key Key, text string) {
 	t.send(platform.SurfaceEvent{Kind: platform.KeyReleased, Key: platform.Key(key), Mods: platform.Modifiers(mods)})
 }
 
+// TypeIntent presses a key that types text while no text input has the
+// focus, as macOS tells it (InputEvent.Intent): only the observers see
+// text. It reports whether one claimed it.
+func (t *Tester) TypeIntent(text string) bool {
+	taken := t.rt.event(platform.SurfaceEvent{Kind: platform.TextInput, Text: text, Intent: true})
+	t.settle()
+	return taken
+}
+
 // Type types text into the focused text input.
 func (t *Tester) Type(s string) {
 	t.send(platform.SurfaceEvent{Kind: platform.TextInput, Text: s})
